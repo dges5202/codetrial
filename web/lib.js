@@ -2087,8 +2087,8 @@ export function taskCodeTooLarge(code) {
   return textEncoder.encode(code).length > TASK_MAX_CODE_BYTES;
 }
 
-export function taskEditPayload(revisionId, code) {
-  return { code, language: "python", revisionId };
+export function taskEditPayload(revisionId, code, language) {
+  return { ...codeUpdatePayload(code, language), revisionId };
 }
 
 export function taskConnectedPayload() {

@@ -384,7 +384,7 @@ impl TaskSession {
     }
 
     pub fn new(task: PinnedTask, now: u64) -> Self {
-        let code = task.exercise.starter("python").unwrap_or("");
+        let code = task.exercise.starter(task.language()).unwrap_or("");
         let initial = revision("initial", code);
         let checks = task
             .exercise
@@ -705,7 +705,7 @@ impl TaskSession {
             if !self
                 .task
                 .exercise
-                .completion_targets()
+                .targets_in(self.task.language())
                 .iter()
                 .any(|row| &row.id == target)
             {
@@ -1103,7 +1103,7 @@ impl TaskSession {
             Some(TOPIC_CODE_UPDATE) => serde_json::from_slice::<EditMessage>(payload)
                 .map_err(|_| invalid("invalid task edit"))
                 .and_then(|message| {
-                    if message.language != "python" {
+                    if message.language != self.task.language() {
                         return Err(invalid("invalid task language"));
                     }
                     self.acknowledge_edit(&message.revision_id, &message.code, now)

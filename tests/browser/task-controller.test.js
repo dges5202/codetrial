@@ -1,14 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { ALL_LANGUAGES } from "../../web/compiler-explorer.js";
 import {
   acceptTaskState,
   outcomeSentence,
   rulesInWords,
   taskLocked,
+  taskCodeFileName,
   taskRecovery,
   taskReviewForDisplay,
 } from "../../web/task-controller.js";
 import {
+  languageLabel,
   taskActionPayload,
   taskEndPayload,
   taskRevisionPayload,
@@ -177,4 +180,20 @@ test("the server task review fixtures have integer versions and render as sent",
     assert.equal(Number.isInteger(payload.taskAssessment.setVersion), true);
     assert.deepEqual(taskReviewForDisplay(payload), payload);
   }
+});
+
+test("every language a task may allow has a name and a file extension", () => {
+  // The server's list is LANGUAGES in src/tasks/mod.rs; the runners' is
+  // this one, and the two name the same five.
+  assert.deepEqual(ALL_LANGUAGES.map(languageLabel), [
+    "Python",
+    "JavaScript",
+    "C",
+    "C++",
+    "Java",
+  ]);
+  assert.deepEqual(
+    ALL_LANGUAGES.map((language) => taskCodeFileName("two-sum", language)),
+    ["two-sum.py", "two-sum.js", "two-sum.c", "two-sum.cpp", "two-sum.java"],
+  );
 });

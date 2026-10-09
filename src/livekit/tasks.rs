@@ -960,7 +960,7 @@ impl<'a> TaskLive<'a> {
                 .prompt(
                     Phase::Ready,
                     None,
-                    task.exercise.starter("python").unwrap_or(""),
+                    task.exercise.starter(task.language()).unwrap_or(""),
                 )
                 .expect("validated task prompt"),
         }
