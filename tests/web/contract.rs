@@ -9,6 +9,7 @@ use super::*;
 #[tokio::test]
 async fn static_home_markup_matches_frontend_contract() {
     let (base, server) = spawn_web_server(WebServerConfig {
+        tasks: None,
         web_dir: Path::new("web").to_path_buf(),
         github_client_id: None,
         github_client_secret: None,
@@ -63,6 +64,7 @@ async fn static_home_markup_matches_frontend_contract() {
 #[tokio::test]
 async fn static_interview_markup_exposes_offline_surface() {
     let (base, server) = spawn_web_server(WebServerConfig {
+        tasks: None,
         web_dir: Path::new("web").to_path_buf(),
         github_client_id: None,
         github_client_secret: None,
@@ -109,6 +111,30 @@ async fn static_interview_markup_exposes_offline_surface() {
     }
 
     server.shutdown().await;
+}
+
+#[test]
+fn task_topic_table_matches_the_task_room() {
+    let topics = fs::read_to_string("web/lib.js").unwrap();
+    let start = topics.find("export const TASK_TOPICS").unwrap();
+    let table = &topics[start..start + topics[start..].find("});").unwrap()];
+    let expected = [
+        ("connected", TOPIC_TASK_CONNECTED),
+        ("start", TOPIC_TASK_START),
+        ("end", TOPIC_TASK_END),
+        ("thinking", TOPIC_TASK_THINKING),
+        ("error", TOPIC_TASK_ERROR),
+        ("action", TOPIC_TASK_ACTION),
+        ("revision", TOPIC_TASK_REVISION),
+        ("run", TOPIC_TASK_RUN),
+        ("state", TOPIC_TASK_STATE),
+        ("review", TOPIC_TASK_REVIEW),
+    ];
+    for (key, topic) in expected {
+        let entry = format!("{key}: {topic:?}");
+        assert!(table.contains(&entry), "TASK_TOPICS must carry {entry}");
+    }
+    assert_eq!(table.matches(": \"").count(), expected.len());
 }
 
 #[test]
