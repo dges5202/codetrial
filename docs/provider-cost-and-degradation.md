@@ -195,11 +195,14 @@ rate. `CODETRIAL_MAX_INTERIM_REVIEWS` defaults to 6, accepts `0` to disable
 the reviews, and is capped at 72. This is a quota guard, not a completeness
 limit: the final report still receives the complete transcript and editor state.
 
-The phase judge, which records the conversational REACTO steps from the
-candidate's own words, uses the same report model and keys. Every judgment
-needs a candidate turn or editor it has not read, or the window of a call that
-failed, and a step it records still open: Repeat, Example and Algorithm until
-Coding is recorded, Coding and Optimizations while there is code. On the watch
+The phase judge, which records the interview's steps from the candidate's own
+words and editor, uses the same report model and keys. At a typed editor it is
+their only recorder, since the interviewer has no evidence tool there. Every
+judgment needs a candidate turn or editor it has not read, or the window of a
+call that failed, and a step it records still open: Repeat, Example and
+Algorithm until Coding is recorded, Coding and Optimizations while there is
+code, Test while nothing can run the written code, and the STAR steps once the
+behavioral round has opened, read from where it opened. On the watch
 tick one starts once the candidate has been quiet and not typing for 2 seconds,
 no more often than every 6 seconds, or every 30 seconds when only the editor
 changed; typing pauses every few seconds while Coding is open, so editor-only
@@ -207,7 +210,8 @@ judgments also take at most 12 of the calls. The end and a held round
 transition may start one sooner: the end waits at most 5 seconds in all for its
 judgments, and a round transition is held at most 5 seconds while the room
 keeps running, or until the resume when the interview is paused. Both share the
-ceiling of 48 calls per interview. Each reads at most 6 KiB of transcript tail
+ceiling of 48 calls per interview, of which a coding round leaves 8 for a
+behavioral round still to come. Each reads at most 6 KiB of transcript tail
 and 6 KiB of editor. A rate limit on a judgment does not cool the key, so the
 judge cannot leave the final report without one.
 
@@ -408,8 +412,8 @@ and prohibit returning to it merely to recover earlier work. They also omit
 coding-run progress cues. Coding checkpoint output is unchanged by these mode
 guards; no token reduction is claimed for this correctness fix.
 
-Only while a pair is configured do `read_editor`, `log_hint` and
-`record_framework_evidence` answers also carry the latest unanswered candidate
+Only while a pair is configured do `read_editor`, `log_hint` and, at a
+whiteboard, `record_framework_evidence` answers also carry the latest unanswered candidate
 utterance, as quoted data, so a reply owed across a cut is not lost, and only
 while a cut is plausible (as below) and the floor is not held. Without a
 pair these application-level additions are omitted. Provider-default sliding

@@ -5,7 +5,7 @@
 //! test and not an integration test: private items are in scope.
 
 use super::*;
-use crate::agent::ThinkingHold;
+use crate::agent::{InterviewLoop, ThinkingHold};
 
 /// A pause arms the discard so a turn already in flight cannot speak over
 /// the resume. Arming it on a turn that has finished is the failure: its
@@ -1527,12 +1527,54 @@ fn the_phase_judge_follows_a_candidate_turn_within_seconds() {
         !activity.claim_phase_judge(&spoke(), idle + PHASE_JUDGE_COOLDOWN * 4),
         "past the ceiling the interviewer's own calls remain"
     );
-    assert!(!activity.reserve_phase_judge(idle));
+    let opened = RuntimeState {
+        behavioral_round_started: true,
+        ..spoke()
+    };
+    assert!(!activity.reserve_phase_judge(&opened, idle));
     activity.phase_judges = MAX_PHASE_JUDGES - 1;
-    assert!(activity.reserve_phase_judge(idle));
+    assert!(activity.reserve_phase_judge(&opened, idle));
     assert_eq!(activity.phase_judges, MAX_PHASE_JUDGES);
     assert_eq!(activity.last_phase_judge, Some(idle));
-    assert!(!activity.reserve_phase_judge(idle + PHASE_JUDGE_COOLDOWN));
+    assert!(!activity.reserve_phase_judge(&opened, idle + PHASE_JUDGE_COOLDOWN));
+}
+
+/// Without the evidence tool only the judge records STAR, so a coding round
+/// whose steps never closed must not spend the calls a behavioral round still
+/// to come needs. Nothing is held back once that round has opened, been
+/// refused, or was never planned.
+#[test]
+fn the_coding_round_leaves_judgments_for_the_behavioral_round() {
+    let now = Instant::now();
+    let coding = RuntimeState::default();
+    assert_eq!(coding.interview_loop, InterviewLoop::CodingBehavioral);
+    let mut activity = RuntimeActivity::new(now);
+    activity.phase_judges = MAX_PHASE_JUDGES - BEHAVIORAL_PHASE_JUDGES - 1;
+    assert!(activity.reserve_phase_judge(&coding, now));
+    assert!(
+        !activity.reserve_phase_judge(&coding, now),
+        "the rest is the behavioral round's"
+    );
+    for state in [
+        RuntimeState {
+            behavioral_round_started: true,
+            round_transition_seen: true,
+            ..RuntimeState::default()
+        },
+        RuntimeState {
+            round_transition_seen: true,
+            ..RuntimeState::default()
+        },
+        RuntimeState {
+            interview_loop: InterviewLoop::CodingOnly,
+            ..RuntimeState::default()
+        },
+    ] {
+        activity.phase_judges = MAX_PHASE_JUDGES - BEHAVIORAL_PHASE_JUDGES;
+        assert!(activity.reserve_phase_judge(&state, now));
+        activity.phase_judges = MAX_PHASE_JUDGES;
+        assert!(!activity.reserve_phase_judge(&state, now));
+    }
 }
 
 /// Typing pauses every few seconds while Coding is open, so a judgment asked

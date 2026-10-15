@@ -2385,7 +2385,11 @@ pub(super) async fn send_wrap_up_and_wait(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let farewell = with_timer(
         context.state,
-        wrap_up(reason, context.state.behavioral_round_started),
+        wrap_up(
+            reason,
+            context.state.behavioral_round_started
+                && crate::agent::evidence_tool_declared(context.state.interview_mode),
+        ),
     );
     send_model_text(
         context.gemini,

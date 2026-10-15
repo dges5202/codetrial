@@ -1930,16 +1930,6 @@ pub fn live_tool_declarations(
     } else {
         "Record hint usage; requested true returns the permitted clue and current editor."
     };
-    let evidence_sources = if mode.is_whiteboard() {
-        json!(["candidate_speech", "board_snapshot", "session_timing"])
-    } else {
-        json!([
-            "candidate_speech",
-            "editor_snapshot",
-            "test_event",
-            "session_timing"
-        ])
-    };
     let coding_only = interview_loop == crate::agent::InterviewLoop::CodingOnly;
     let phases = if coding_only {
         json!(crate::agent::REACTO_PHASE_IDS)
@@ -1981,7 +1971,13 @@ pub fn live_tool_declarations(
                 "required": ["requested"]
             }
         }),
-        json!({
+    ];
+
+    // Only where the platform cannot record every step itself; see
+    // `evidence_tool_declared`. A whiteboard's sources are its own: there is no
+    // editor and no test run there.
+    if crate::agent::evidence_tool_declared(mode) {
+        tools.push(json!({
             "name": TOOL_RECORD_FRAMEWORK_EVIDENCE,
             "description": evidence_description,
 
@@ -1993,15 +1989,15 @@ pub fn live_tool_declarations(
                 "type": "OBJECT",
                 "properties": {
                     "phase": { "type": "STRING", "enum": phases },
-                    "source": { "type": "STRING", "enum": evidence_sources },
+                    "source": { "type": "STRING", "enum": ["candidate_speech", "board_snapshot", "session_timing"] },
                     "kind": { "type": "STRING", "enum": ["observed", "inferred", "skipped"] },
                     "confidence": { "type": "INTEGER", "minimum": 0, "maximum": 100 },
                     "summary": { "type": "STRING", "description": "Short evidence-grounded summary without scores or private rubric text." }
                 },
                 "required": ["phase", "source", "kind", "confidence", "summary"]
             }
-        }),
-    ];
+        }));
+    }
     if interview_loop != crate::agent::InterviewLoop::CodingOnly {
         tools.push(json!({
             "name": TOOL_END_INTERVIEW,

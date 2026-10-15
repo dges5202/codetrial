@@ -1810,20 +1810,6 @@ fn live_setup_uses_native_audio_voice_tools_and_transcription() {
             .contains("45-minute coding interview over video")
     );
 
-    // Schema.Type is an enum, so these are value names and the case is not
-    // cosmetic. The report schema next door is rejected for the lowercase
-    // spelling, and matching case-insensitively here would pass for the
-    // spelling that only works because this endpoint happens to be lenient.
-    let params = &setup["tools"][0]["functionDeclarations"][3]["parameters"];
-    assert_eq!(params["type"], "OBJECT");
-    for field in ["phase", "source", "kind", "summary"] {
-        assert_eq!(
-            params["properties"][field]["type"], "STRING",
-            "{field} must name Schema.Type exactly"
-        );
-    }
-    assert_eq!(params["properties"]["confidence"]["type"], "INTEGER");
-
     assert_eq!(
         setup["tools"][0]["functionDeclarations"][0]["name"],
         TOOL_READ_EDITOR
@@ -1854,28 +1840,23 @@ fn live_setup_uses_native_audio_voice_tools_and_transcription() {
         );
     }
     assert!(conversation["parameters"].get("required").is_none());
-    let framework_tool = &setup["tools"][0]["functionDeclarations"][3];
-    assert_eq!(framework_tool["name"], TOOL_RECORD_FRAMEWORK_EVIDENCE);
-    assert_eq!(
-        framework_tool["parameters"]["required"],
-        json!(["phase", "source", "kind", "confidence", "summary"])
-    );
+
+    // At a typed editor the platform records every step, so the interviewer is
+    // not offered a tool whose every call held its reply back by a second model
+    // pass; see `evidence_tool_declared`.
     assert!(
-        framework_tool["parameters"]["properties"]
-            .get("atMs")
-            .is_none()
-    );
-    assert!(
-        framework_tool["parameters"]["properties"]
-            .get("frameworkVersion")
-            .is_none()
+        setup["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["name"] != TOOL_RECORD_FRAMEWORK_EVIDENCE)
     );
 
     // The tool that lets an interview end when it is over rather than when the
     // clock says so. No parameters: the reason is always the same one, and a
     // free-text field here would be a second place for the closing to be
     // written.
-    let ending_tool = &setup["tools"][0]["functionDeclarations"][4];
+    let ending_tool = &setup["tools"][0]["functionDeclarations"][3];
     assert_eq!(ending_tool["name"], TOOL_END_INTERVIEW);
     assert!(ending_tool.get("parameters").is_none());
 
@@ -1891,7 +1872,7 @@ fn live_setup_uses_native_audio_voice_tools_and_transcription() {
         .iter()
         .map(|tool| tool["name"].clone())
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 4);
+    assert_eq!(names.len(), 3);
     assert!(!names.contains(&json!(TOOL_END_INTERVIEW)));
     assert_eq!(
         setup["inputAudioTranscription"],
@@ -2004,6 +1985,27 @@ fn a_whiteboard_session_is_offered_the_board_and_not_the_editor() {
         tools[3]["parameters"]["properties"]["source"]["enum"],
         json!(["candidate_speech", "board_snapshot", "session_timing"])
     );
+
+    // Schema.Type is an enum, so these are value names and the case is not
+    // cosmetic. The report schema next door is rejected for the lowercase
+    // spelling, and matching case-insensitively here would pass for the
+    // spelling that only works because this endpoint happens to be lenient.
+    let params = &tools[3]["parameters"];
+    assert_eq!(params["type"], "OBJECT");
+    for field in ["phase", "source", "kind", "summary"] {
+        assert_eq!(
+            params["properties"][field]["type"], "STRING",
+            "{field} must name Schema.Type exactly"
+        );
+    }
+    assert_eq!(params["properties"]["confidence"]["type"], "INTEGER");
+
+    assert_eq!(
+        params["required"],
+        json!(["phase", "source", "kind", "confidence", "summary"])
+    );
+    assert!(params["properties"].get("atMs").is_none());
+    assert!(params["properties"].get("frameworkVersion").is_none());
     assert!(
         setup["systemInstruction"]["parts"][0]["text"]
             .as_str()
@@ -4153,7 +4155,19 @@ fn provider_voice_activity_parses_only_known_activity_types() {
 
 #[test]
 fn coding_only_tool_schema_excludes_behavioral_phases_on_both_surfaces() {
+    // Only a whiteboard is offered the tool at all.
     for mode in [InterviewMode::Coding, InterviewMode::Whiteboard] {
+        if !crate::agent::evidence_tool_declared(mode) {
+            let tools = live_tool_declarations(crate::agent::InterviewLoop::CodingBehavioral, mode);
+            assert!(
+                tools
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|tool| tool["name"] != TOOL_RECORD_FRAMEWORK_EVIDENCE)
+            );
+            continue;
+        }
         let coding = live_tool_declarations(crate::agent::InterviewLoop::CodingOnly, mode);
         let full = live_tool_declarations(crate::agent::InterviewLoop::CodingBehavioral, mode);
         let find = |tools: Value| {

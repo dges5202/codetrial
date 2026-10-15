@@ -73,9 +73,10 @@ pub use prompts::{
     with_owed_reply, wrap_up,
 };
 pub(crate) use prompts::{
-    editor_tool_continuity, end_interview_refusal, evidenced_among, latest_candidate_continuity,
-    numbered_bounded_line, numbered_from_with_limit, pending_candidate_line,
-    read_editor_text_from_numbered, report_transcript_lines, tool_editor_review,
+    behavioral_round_start, editor_tool_continuity, end_interview_refusal, evidenced_among,
+    latest_candidate_continuity, numbered_bounded_line, numbered_from_with_limit,
+    pending_candidate_line, read_editor_text_from_numbered, report_transcript_lines,
+    tool_editor_review,
 };
 pub(crate) use report::{MAX_ERROR_CHARS, Sanitized, sanitize_report_candidate};
 pub use report::{
@@ -969,6 +970,11 @@ pub struct RuntimeState {
     /// again only what it read: an editor-only call that failed is retried as
     /// one, at the editor's pace and against its cap, not as a speech call.
     pub judged_for: PhaseJudgeDue,
+    /// Whether the phase judge found the candidate declining the behavioral
+    /// question. The steps of that probe stay unassessed rather than skipped
+    /// at the end, which in a session without the evidence tool the platform
+    /// writes on the interviewer's behalf.
+    pub star_declined: bool,
     /// The editor the last idle-window review was sent. A review whose code
     /// has not changed since says so instead of sending up to four kilobytes
     /// a note on record already read; like the transcript cursor, it moves
@@ -1110,6 +1116,7 @@ impl Default for RuntimeState {
             judged_code: String::new(),
             judged_language: String::new(),
             judged_for: PhaseJudgeDue::No,
+            star_declined: false,
             interim_code: String::new(),
             earlier_steps_named: Vec::new(),
             earlier_steps_pending: Vec::new(),
@@ -1319,6 +1326,23 @@ fn evict_one_observation(evidence: &mut Vec<FrameworkEvidence>) {
     evidence.remove(doomed.unwrap_or(0));
 }
 
+/// Whether the live interviewer is given `record_framework_evidence`.
+///
+/// Every call is a tool round in front of the reply it precedes: the model
+/// waits for the answer and then runs a second pass before it speaks. With a
+/// typed editor the platform records every step without it, the phase judge
+/// from the conversation and the editor and Test from the run or a spoken
+/// trace, so the tool only costs time; neither a prompt telling the model not
+/// to call it nor leaving steps out of its schema stopped the calls. Only a
+/// whiteboard needs it, where Coding and Test are drawn and the judge, which
+/// is not shown the board, cannot see them.
+///
+/// Fixed for the session, since a replaced or resumed socket is set up from
+/// the same boot.
+pub fn evidence_tool_declared(mode: InterviewMode) -> bool {
+    mode.is_whiteboard()
+}
+
 /// The REACTO steps the phase judge records. Test is the platform's from the
 /// run itself; these are the ones only understanding can tick.
 const JUDGED_PHASES: [FrameworkPhase; 5] = [
@@ -1327,6 +1351,29 @@ const JUDGED_PHASES: [FrameworkPhase; 5] = [
     FrameworkPhase::Algorithm,
     FrameworkPhase::Coding,
     FrameworkPhase::Optimizations,
+];
+
+/// The behavioral round's steps, which the judge records once the round has
+/// opened, from what the candidate said inside it.
+const JUDGED_STAR: [FrameworkPhase; 4] = [
+    FrameworkPhase::Situation,
+    FrameworkPhase::Task,
+    FrameworkPhase::Action,
+    FrameworkPhase::Result,
+];
+
+/// Every step a judgment may name, for reading one back.
+const JUDGEABLE: [FrameworkPhase; 10] = [
+    FrameworkPhase::Repeat,
+    FrameworkPhase::Example,
+    FrameworkPhase::Algorithm,
+    FrameworkPhase::Coding,
+    FrameworkPhase::Test,
+    FrameworkPhase::Optimizations,
+    FrameworkPhase::Situation,
+    FrameworkPhase::Task,
+    FrameworkPhase::Action,
+    FrameworkPhase::Result,
 ];
 
 /// Transcript the judge reads, the latest stretch within the bound. A tail
@@ -1347,8 +1394,9 @@ const MIN_QUOTE_WORDS: usize = 4;
 const MAX_PHASE_JUDGE_SUMMARY_CHARS: usize = 120;
 const MAX_PHASE_JUDGE_QUOTE_CHARS: usize = 110;
 
-/// The steps the judge may still record, in checklist spelling. None in the
-/// behavioral round, and none about code before there is code.
+/// The steps the judge may still record, in checklist spelling: the STAR
+/// steps once the behavioral round has opened, the coding ones before it, and
+/// none about code before there is code.
 ///
 /// Not closed by the end of the interview: the end waits for a judgment of
 /// the candidate's last answer, and the report is written after it.
@@ -1357,14 +1405,24 @@ const MAX_PHASE_JUDGE_QUOTE_CHARS: usize = 110;
 /// recorded. A candidate who skipped one would otherwise keep a call due after
 /// every turn for the rest of the session, spending the budget before
 /// Optimizations, and what was said before or while the code was written was
-/// judged while it was. The interviewer can still record them.
+/// judged while it was.
+///
+/// Test is the run's, so it is open only while nothing can run the code: a
+/// hand trace is then the only testing, and without the evidence tool the
+/// judge is the only one who can record it.
 pub fn phase_judge_open(state: &RuntimeState) -> Vec<&'static str> {
     if state.behavioral_round_started {
-        return Vec::new();
+        return JUDGED_STAR
+            .into_iter()
+            .filter(|phase| !phases_evidenced(state, &[*phase]))
+            .map(phase_id)
+            .collect();
     }
     let coded = phases_evidenced(state, &[FrameworkPhase::Coding]);
+    let traced = test_source(state) == TestSource::Trace;
     let unrecorded = JUDGED_PHASES
         .into_iter()
+        .chain(traced.then_some(FrameworkPhase::Test))
         .filter(|phase| !phases_evidenced(state, &[*phase]))
         .filter(|phase| phase.needs_code() || !coded)
         .collect::<Vec<_>>();
@@ -1435,8 +1493,11 @@ pub fn phase_judge_due(state: &RuntimeState) -> bool {
 /// Moved when the call goes out, as the interim window is: a call that fails
 /// costs nothing, because the next one reads the same tail.
 pub fn take_phase_judge_window(state: &mut RuntimeState, problem: &Problem) -> String {
-    // Only the tail is marked, since only the tail is sent.
-    let tail = &state.transcript[tail_start(&state.transcript, PHASE_JUDGE_WINDOW_BYTES)..];
+    // Only the tail is marked, since only the tail is sent. A behavioral round
+    // is read from where it opened: an answer given before it was asked for
+    // counts for nothing, as the report reads it.
+    let lines = &state.transcript[judged_from(state)..];
+    let tail = &lines[tail_start(lines, PHASE_JUDGE_WINDOW_BYTES)..];
     let window = transcript_tail(&mark_unrecognized_turns(tail), PHASE_JUDGE_WINDOW_BYTES);
     state.judged_for = phase_judge_need(state);
     state.judged_transcript_lines = state.transcript.len();
@@ -1492,14 +1553,24 @@ struct Turn {
     words: String,
 }
 
+/// The first transcript line the judge reads and may quote: the opening of
+/// the behavioral round once it has one, else the whole conversation.
+fn judged_from(state: &RuntimeState) -> usize {
+    if state.behavioral_round_started {
+        behavioral_round_start(state).min(state.transcript.len())
+    } else {
+        0
+    }
+}
+
 /// The transcript as turns: adjacent lines of one speaker joined, since the
 /// recognizer can split one answer into two lines with nothing between them.
 /// An unrecognized line ends a turn without joining one, as it carries no
-/// words.
+/// words. Only what the judge may quote, from `judged_from`.
 fn speaker_turns(state: &RuntimeState) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
     let mut joinable = false;
-    for line in &state.transcript {
+    for line in &state.transcript[judged_from(state)..] {
         let spoken = [CANDIDATE_SPEAKER, INTERVIEWER_SPEAKER]
             .into_iter()
             .find_map(|speaker| speaker_speech(line, speaker).map(|text| (speaker, text)));
@@ -1539,7 +1610,13 @@ fn quote_is_grounded(
     quote: &str,
 ) -> bool {
     let words = quote_words(quote);
-    let least = if phase.needs_code() {
+
+    // A spoken trace is a sentence like any other answer, though Test is about
+    // code.
+    let least = if matches!(
+        phase,
+        FrameworkPhase::Coding | FrameworkPhase::Optimizations
+    ) {
         MIN_QUOTE_WORDS
     } else {
         MIN_SPOKEN_QUOTE_WORDS
@@ -1559,10 +1636,15 @@ fn quote_is_grounded(
     if !said.any(|turn| turn.speaker == CANDIDATE_SPEAKER) {
         return false;
     }
-    let echo = matches!(
-        phase,
-        FrameworkPhase::Algorithm | FrameworkPhase::Optimizations
-    ) && first.speaker == INTERVIEWER_SPEAKER;
+
+    // A trace the interviewer walked first, or a story they told back before
+    // the candidate did, is the candidate agreeing too.
+    let echo = (phase.is_star()
+        || matches!(
+            phase,
+            FrameworkPhase::Algorithm | FrameworkPhase::Optimizations | FrameworkPhase::Test
+        ))
+        && first.speaker == INTERVIEWER_SPEAKER;
     !echo
 }
 
@@ -1593,6 +1675,15 @@ pub fn apply_phase_judgment(state: &mut RuntimeState, text: &str) -> Vec<Framewo
     let Ok(answer) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
         return Vec::new();
     };
+
+    // Read before the steps, since a refusal comes with none. Kept once seen: a
+    // story told after declining is still recorded, and the probe the candidate
+    // turned down stays unassessed rather than skipped.
+    if state.behavioral_round_started
+        && answer.get("declined").and_then(serde_json::Value::as_bool) == Some(true)
+    {
+        state.star_declined = true;
+    }
     let Some(steps) = answer
         .get("steps")
         .and_then(serde_json::Value::as_array)
@@ -1609,17 +1700,14 @@ pub fn apply_phase_judgment(state: &mut RuntimeState, text: &str) -> Vec<Framewo
     let mut turns = None;
     let mut code_current = None;
     let mut recorded = Vec::new();
-    for step in steps.iter().take(JUDGED_PHASES.len()) {
+    for step in steps.iter().take(JUDGEABLE.len()) {
         let (Some(id), Some(quote)) = (
             step.get("step").and_then(serde_json::Value::as_str),
             step.get("quote").and_then(serde_json::Value::as_str),
         ) else {
             continue;
         };
-        let Some(phase) = JUDGED_PHASES
-            .into_iter()
-            .find(|phase| phase_id(*phase) == id)
-        else {
+        let Some(phase) = JUDGEABLE.into_iter().find(|phase| phase_id(*phase) == id) else {
             continue;
         };
         if !open.contains(&id) || phases_evidenced(state, &[phase]) {
