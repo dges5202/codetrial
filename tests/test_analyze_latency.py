@@ -563,6 +563,29 @@ class CliTests(unittest.TestCase):
                 report["origins"]["last_voiced_pcm"]["mean_ms"],
                 {"before": 1_000.0, "after": 600.0},
             )
+            # Strict mode holds both logs to what it holds one to.
+            self.assertEqual(
+                run(
+                    "--compare", str(before), "--strict", stdin=after + "\n"
+                ).returncode,
+                0,
+            )
+            truncated = after + '\ncodetrial latency {"event"\n'
+            self.assertEqual(
+                run("--compare", str(before), stdin=truncated).returncode, 0
+            )
+            self.assertEqual(
+                run("--compare", str(before), "--strict", stdin=truncated).returncode,
+                1,
+            )
+            with open(before, "a", encoding="utf-8") as stream:
+                stream.write('codetrial latency {"event"\n')
+            self.assertEqual(
+                run(
+                    "--compare", str(before), "--strict", stdin=after + "\n"
+                ).returncode,
+                1,
+            )
 
     def test_text_and_json_reports(self):
         text = run(stdin=captured() + "\n")

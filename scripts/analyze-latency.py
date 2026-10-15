@@ -842,6 +842,11 @@ def summary_lines(report):
     return out
 
 
+def strict_pass(report):
+    """What --strict asks of a report beyond having records at all."""
+    return not report["rejected_records"] and verdict(report) != "NO_DATA"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("log", nargs="?", help="server log; omit to read stdin")
@@ -889,7 +894,7 @@ def main():
             if args.json
             else render_comparison(comparison)
         )
-        return 0
+        return int(args.strict and not all(map(strict_pass, (before, report))))
     if args.json:
         print(json.dumps(report, indent=2))
     elif args.summary:
@@ -898,7 +903,7 @@ def main():
         print(render(report))
     if not report["turns"]:
         return 1
-    if args.strict and (report["rejected_records"] or verdict(report) == "NO_DATA"):
+    if args.strict and not strict_pass(report):
         return 1
     return 0
 
