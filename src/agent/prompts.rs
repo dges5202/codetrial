@@ -261,7 +261,8 @@ can read their editor at any moment with `read_editor`.",
   or for code no [SYSTEM EVENT] or tool answer has shown you. The platform
   sends every change and says when there is none, so what you were last shown
   is what is on screen; before any snapshot that is only the starter, which
-  needs no read. A cut page or an excerpt does not show the whole
+  needs no read. A language they name aloud needs none either: choosing it
+  on the tabs sends its own [SYSTEM EVENT]. A cut page or an excerpt does not show the whole
   buffer: read the lines it names before claiming an implementation or
   technique is absent.",
         evidence_sources_note: "only after candidate speech, an editor snapshot,
@@ -1699,16 +1700,16 @@ pub fn silence_nudge(state: &RuntimeState, evidence: &str, excerpt: Option<&str>
         .is_some_and(super::evidence::run_failed_to_start);
     let with_code = match coding_progress_without_presence(state) {
         Some(progress) if super::coding_continues_past_gate(state) => {
-            format!("if code is present: {progress}")
+            progress
         }
         Some(progress) if super::coding_round_complete(state) => format!(
-            "if code is present: {progress} Ask whether they have anything to add, or wrap up the coding discussion under the round plan."
+            "{progress} Ask whether they have anything to add, or wrap up the coding discussion under the round plan."
         ),
         Some(progress) => {
-            format!("if code is present: {progress} Ask about the next step they have not covered.")
+            format!("{progress} Ask about the next step they have not covered.")
         }
-        None if setup_error => "if code is present, the latest attempt hit a runner setup error, not completed tests: ask what they will verify before a retry, which needs no code change, without supplying the cause or fix.".to_string(),
-        None => "if code is present, ask them to narrate or test it.".to_string(),
+        None if setup_error => "The latest attempt hit a runner setup error, not completed tests: ask what they will verify before a retry, which needs no code change, without supplying the cause or fix.".to_string(),
+        None => "Ask them to narrate or test their code.".to_string(),
     };
     let written = super::code_written(state);
     let with_code = match candidate_code_presence_given(state, written) {
@@ -1716,15 +1717,35 @@ pub fn silence_nudge(state: &RuntimeState, evidence: &str, excerpt: Option<&str>
         None => with_code,
     };
 
-    // The server knows when the editor holds edits, so the empty-editor branch
-    // is left out then rather than sent for the model to rule out.
-    let empty_editor = if written {
-        ""
+    // With all three planning steps recorded there is nothing left to ask for,
+    // and the question that moves them on is the code.
+    let unwritten = if super::phases_evidenced(
+        state,
+        &[
+            super::FrameworkPhase::Repeat,
+            super::FrameworkPhase::Example,
+            super::FrameworkPhase::Algorithm,
+        ],
+    ) {
+        "ask them to begin writing their code in the editor."
     } else {
-        " If the editor is empty, ask for whichever of their understanding, example, or planned algorithm they have not explained;"
+        "ask for whichever of their understanding, example, or planned algorithm they have not explained."
+    };
+
+    // The server knows whether the editor holds edits, so the nudge says which
+    // rather than offering both branches: asked to choose, the model read the
+    // editor first, a tool round in front of the question. Only an editor
+    // holding just the starter is certainly unwritten; edits too small to count
+    // or too long to compare leave the choice to the editor.
+    let branch = if written {
+        format!(" {with_code}")
+    } else if super::code_untouched(state) {
+        format!(" They have not written code yet: {unwritten}")
+    } else {
+        format!(" If the editor holds none of their code, {unwritten} Otherwise: {with_code}")
     };
     format!(
-        "[SYSTEM EVENT] Silent and not typing for over {SILENCE_THRESHOLD_S:.0} seconds.{}{}Flow 2: ONE short question about their current decision.{empty_editor} {with_code} Do not restart them, restate the problem, supply an example, suggest an approach or reveal a bug.{}",
+        "[SYSTEM EVENT] Silent and not typing for over {SILENCE_THRESHOLD_S:.0} seconds.{}{}Flow 2: ONE short question about their current decision.{branch} Do not restart them, restate the problem, supply an example, suggest an approach or reveal a bug.{}",
         evidence_section(evidence),
         code_access(excerpt),
         behavioral_ban(state),

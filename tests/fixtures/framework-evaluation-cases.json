@@ -59,13 +59,13 @@
     {
       "id": "silence-empty-editor",
       "coverage": ["silence-empty"],
-      "reaction": {"kind":"silence", "code":"", "required":["editor is empty", "understanding, example, or planned algorithm"], "forbidden":["use a hash map", "try [2,7]"]},
+      "reaction": {"kind":"silence", "code":"", "required":["have not written code yet", "understanding, example, or planned algorithm"], "forbidden":["use a hash map", "try [2,7]", "code is present"]},
       "transcript":"", "evidence":[], "hintsUsed":0, "round":"none", "assessed":[]
     },
     {
       "id": "silence-with-code",
       "coverage": ["silence-code"],
-      "reaction": {"kind":"silence", "code":"def two_sum(nums, target):\n    return []", "required":["code is present", "narrate or test"], "forbidden":["line 2 is wrong", "replace it with"]},
+      "reaction": {"kind":"silence", "code":"def two_sum(nums, target):\n    return []", "required":["narrate or test their code"], "forbidden":["line 2 is wrong", "replace it with", "have not written code yet", "if code is present"]},
       "transcript":"", "evidence":[{"phase":"coding","source":"editor_snapshot","kind":"observed","confidence":100,"summary":"Editor contains a concrete implementation attempt."}],
       "hintsUsed":0, "round":"none", "assessed":["Coding"]
     },

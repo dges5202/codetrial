@@ -2872,7 +2872,7 @@ fn review_and_time_warning_follow_the_recorded_test_progress() {
     );
     assert_eq!(empty.last_test_run.as_ref().unwrap()["total"], 0);
     assert!(time_warning(&empty).contains("click Run on the highest-value tests"));
-    assert!(silence_nudge(&empty, "", None).contains("narrate or test it"));
+    assert!(silence_nudge(&empty, "", None).contains("narrate or test their code"));
     assert!(!proactive_review(&empty, "", None).contains("latest test run"));
 
     // A setup error is not a run, so the warning still asks for one.
@@ -2915,7 +2915,7 @@ fn silence_after_a_setup_error_allows_retrying_without_code_changes() {
 #[test]
 fn silence_after_tests_does_not_send_the_candidate_back_to_test() {
     let untested = silence_nudge(&with_written_code(RuntimeState::default()), "", None);
-    assert!(untested.contains("narrate or test it"));
+    assert!(untested.contains("narrate or test their code"));
 
     let mut state = with_written_code(RuntimeState {
         last_test_run: Some(json!({"language": "python", "passed": 3, "total": 3,
@@ -3220,7 +3220,7 @@ fn the_progress_clause_names_the_step_actually_open() {
     let mut empty = with_written_code(RuntimeState::default());
     let packet = json!({"language": empty.language, "passed": 0, "total": 0, "code": empty.code});
     apply_data_event(&mut empty, TOPIC_TEST_RESULTS, &packet, 100.0);
-    assert!(silence_nudge(&empty, "", None).contains("narrate or test it"));
+    assert!(silence_nudge(&empty, "", None).contains("narrate or test their code"));
 }
 
 /// A passing result can land after the candidate has typed past the code it

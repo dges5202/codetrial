@@ -1735,6 +1735,14 @@ pub fn code_written(state: &RuntimeState) -> bool {
     written_in(state, &state.language, &state.code)
 }
 
+/// Whether the editor still holds only the starter, give or take layout: the
+/// one state in which the candidate has certainly written nothing, where
+/// `code_written` being false may also mean too little to count or a change
+/// too long to compare.
+pub fn code_untouched(state: &RuntimeState) -> bool {
+    content_chars(&state.code).eq(content_chars(starter(state, &state.language)))
+}
+
 /// The starter the page served for `language`, or nothing for one it did not.
 fn starter<'a>(state: &'a RuntimeState, language: &str) -> &'a str {
     state

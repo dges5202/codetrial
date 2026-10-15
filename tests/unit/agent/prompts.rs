@@ -550,7 +550,7 @@ fn recovery_envelope_keeps_archive_order_and_trust_boundaries_in_each_round() {
 #[test]
 fn nudges_and_reviews_omit_what_the_session_already_rules_out() {
     let ban = "Never ask, repeat, or return to a behavioral or experience question here.";
-    let empty = "If the editor is empty";
+    let empty = "They have not written code yet";
     let presence = "Current editor has candidate edits";
     let mut state = RuntimeState {
         language: "python".into(),
@@ -574,6 +574,45 @@ fn nudges_and_reviews_omit_what_the_session_already_rules_out() {
     .unwrap();
     assert!(!silence_nudge(&state, "", None).contains(presence));
 
+    // With nothing written the nudge says so instead of offering a branch for
+    // code, which the model would read the editor to rule out.
     state.code.clear();
-    assert!(silence_nudge(&state, "", None).contains(empty));
+    let unwritten = silence_nudge(&state, "", None);
+    assert!(unwritten.contains(empty), "{unwritten}");
+    assert!(!unwritten.contains("narrate"), "{unwritten}");
+
+    // Edits too small to count as written are not nothing, so the nudge does
+    // not deny them; it leaves the choice to the editor.
+    state.code = "x=1".to_string();
+    assert!(!crate::agent::code_written(&state));
+    let small = silence_nudge(&state, "", None);
+    assert!(!small.contains(empty), "{small}");
+    assert!(
+        small.contains("If the editor holds none of their code"),
+        "{small}"
+    );
+    assert!(
+        small.contains("Otherwise: Ask them to narrate or test their code."),
+        "{small}"
+    );
+
+    // With understanding, example and algorithm recorded and nothing written,
+    // there is no planning step left to ask for: the question is the code.
+    state.code.clear();
+    for phase in ["repeat", "example", "algorithm"] {
+        crate::agent::record_framework_evidence(
+            &mut state,
+            &serde_json::json!({"phase": phase, "source": "candidate_speech",
+                "kind": "observed", "confidence": 90, "summary": "Explained it."}),
+        )
+        .unwrap();
+    }
+    let planned = silence_nudge(&state, "", None);
+    assert!(
+        planned.contains(
+            "They have not written code yet: ask them to begin writing their code in the editor."
+        ),
+        "{planned}"
+    );
+    assert!(!planned.contains("planned algorithm"), "{planned}");
 }
