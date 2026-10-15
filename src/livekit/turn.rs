@@ -1984,9 +1984,6 @@ pub(super) fn closing_order(
 /// losing the interviewer costs the goodbye and not the assessment.
 pub(super) const INTERVIEWER_UNAVAILABLE: &str = "interviewer_unavailable";
 
-/// No goodbye for a candidate who left, and none from an interviewer that
-/// stopped answering: asking it for one would only spend `WRAP_UP_WAIT` in
-/// silence before the report the candidate is waiting for.
 /// Whether a behavioral round may still open, which the coding round's routine
 /// judgments leave `BEHAVIORAL_PHASE_JUDGES` for.
 fn reserves_for_behavioral(state: &RuntimeState) -> bool {
@@ -1995,6 +1992,9 @@ fn reserves_for_behavioral(state: &RuntimeState) -> bool {
         && !state.round_transition_seen
 }
 
+/// No goodbye for a candidate who left, and none from an interviewer that
+/// stopped answering: asking it for one would only spend `WRAP_UP_WAIT` in
+/// silence before the report the candidate is waiting for.
 pub(super) fn should_send_wrap_up(reason: &str) -> bool {
     reason != "candidate_ended" && reason != INTERVIEWER_UNAVAILABLE
 }
