@@ -4,6 +4,7 @@ import {
   DEFAULT_RUNTIME_CONFIG,
   launchChromium,
   read,
+  FAKE_SPEECH_CAPTURE,
   startStaticServer,
 } from "./source.js";
 
@@ -37,6 +38,7 @@ before(async () => {
     args: [
       "--use-fake-device-for-media-stream",
       "--use-fake-ui-for-media-stream",
+      FAKE_SPEECH_CAPTURE,
       "--autoplay-policy=no-user-gesture-required",
     ],
   });

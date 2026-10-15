@@ -173,6 +173,11 @@ export function memoryStorage() {
   };
 }
 
+// Speech as the fake microphone, not Chromium's built-in beep: under a local
+// sound server the beep is too short for the microphone check that enables
+// Join, so a test passes on a runner without one and fails on a desktop.
+export const FAKE_SPEECH_CAPTURE = `--use-file-for-fake-audio-capture=${join(root, "web", "audio", "test-voice.wav")}`;
+
 /// The browser, or null when there is no browser to be had. Shared so that
 /// every file launching one agrees on what a missing Playwright or an
 /// undownloaded Chromium means. `make check` installs neither, so a null here
