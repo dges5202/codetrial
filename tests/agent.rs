@@ -412,6 +412,7 @@ fn prompt_samples() -> Value {
         }),
         "phaseJudgeSystem": phase_judge_system_instruction(),
         "receivedTestNote": received_test_note(&RuntimeState::default(), false),
+        "unvoicedRecordNote": unvoiced_record_note(),
         "phaseJudgmentNote": phase_judgment_note(
             &RuntimeState::default(),
             &[FrameworkEvidence {

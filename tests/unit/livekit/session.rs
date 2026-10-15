@@ -3664,3 +3664,591 @@ fn conversation_rows_spend_their_budget_exactly() {
     assert_eq!(started["turns"].as_array().unwrap().len(), 2);
     assert_eq!(started["nextByte"], 7);
 }
+
+#[test]
+fn tools_from_a_stalled_generation_during_a_hold_do_not_claim_the_resume_reply() {
+    let start = Instant::now();
+    let mut activity = RuntimeActivity::new(start);
+    activity.latency.voice(start);
+    activity.latency.boundary(Boundary::Held, start);
+    activity.stale_turn_pending = true;
+    let calls = GeminiEvent::ToolCall(vec![GeminiFunctionCall {
+        id: "old".into(),
+        name: "read_editor".into(),
+        args: serde_json::json!({}),
+    }]);
+    assert!(accept_gemini_event(&calls, &mut activity, true, start));
+    assert!(observe_latency_event(&mut activity, &calls, true, start).is_none());
+    assert!(!accept_gemini_event(
+        &GeminiEvent::TurnComplete,
+        &mut activity,
+        true,
+        start
+    ));
+    activity.mark_prompted(start + Duration::from_secs(45), Some("resume"), false);
+    let record = activity
+        .latency
+        .audio(start + Duration::from_millis(45_500))
+        .unwrap();
+    assert_eq!(record["origin"], "prompt");
+    assert_eq!(record["elapsed_ms"], 500);
+}
+
+#[test]
+fn a_silent_completion_settles_runtime_and_latency_debt_together() {
+    let start = Instant::now();
+    let mut activity = RuntimeActivity::new(start);
+    activity.note_candidate_finished(start, false);
+    activity.latency.voice(start);
+    let ended = start + Duration::from_secs(1);
+    assert!(accept_gemini_event(
+        &GeminiEvent::TurnComplete,
+        &mut activity,
+        false,
+        ended
+    ));
+    assert!(!activity.owes_reply());
+    let record =
+        observe_latency_event(&mut activity, &GeminiEvent::TurnComplete, false, ended).unwrap();
+    assert_eq!(record["stage"], "turn_complete");
+    assert!(
+        observe_latency_event(&mut activity, &GeminiEvent::TurnComplete, false, ended).is_none()
+    );
+}
+
+#[test]
+fn provider_text_starts_a_generation_before_a_queued_prompt() {
+    let start = Instant::now();
+    let mut activity = RuntimeActivity::new(start);
+    activity.latency.voice(start);
+    let text = GeminiEvent::Text("provider progress".into());
+    assert!(accept_gemini_event(&text, &mut activity, false, start));
+    observe_latency_event(&mut activity, &text, false, start);
+    activity.mark_prompted(start + Duration::from_millis(100), Some("next"), false);
+    let ended = start + Duration::from_millis(200);
+    assert!(accept_gemini_event(
+        &GeminiEvent::TurnComplete,
+        &mut activity,
+        false,
+        ended
+    ));
+    observe_latency_event(&mut activity, &GeminiEvent::TurnComplete, false, ended);
+    let record = activity
+        .latency
+        .audio(start + Duration::from_millis(500))
+        .unwrap();
+    assert_eq!(record["origin"], "prompt");
+    assert_eq!(record["elapsed_ms"], 400);
+}
+
+#[test]
+fn confirmation_on_a_swallowed_turn_end_closes_the_requested_hold_trace() {
+    let start = Instant::now();
+    let mut activity = RuntimeActivity::new(start);
+    activity.latency.voice(start);
+    activity.latency.audio(start + Duration::from_millis(100));
+    activity.latency.voice(start + Duration::from_millis(200));
+    let interrupted = start + Duration::from_millis(300);
+    assert!(accept_gemini_event(
+        &GeminiEvent::Interrupted,
+        &mut activity,
+        false,
+        interrupted
+    ));
+    observe_latency_event(&mut activity, &GeminiEvent::Interrupted, false, interrupted);
+    let mut state = RuntimeState {
+        thinking_hold: ThinkingHold::Requested { since: start },
+        ..RuntimeState::default()
+    };
+    assert!(!accept_gemini_event(
+        &GeminiEvent::TurnComplete,
+        &mut activity,
+        false,
+        interrupted
+    ));
+    settle_hold_at_turn_end(&mut state, &mut activity);
+    assert!(state.thinking_hold.is_active());
+    assert!(state.end_thinking(2));
+    let released = start + Duration::from_secs(45);
+    activity.note_latency_transcript(released);
+    let record = activity
+        .latency
+        .audio(released + Duration::from_millis(500))
+        .unwrap();
+    assert_eq!(record["origin"], "transcript");
+    assert_eq!(record["elapsed_ms"], 500);
+}
+
+/// Text sent behind a stalled continuation makes Gemini cut that generation.
+/// The cut preserves both waits without new speech. New speech cancels the
+/// old candidate wait, and its words supersede the pending platform prompt.
+#[test]
+fn an_interruption_preserves_platform_debt_until_new_candidate_words_arrive() {
+    for barge_in in [false, true] {
+        let start = Instant::now();
+        let (mut audio, _frames) = test_output_audio();
+        let mut activity = RuntimeActivity::new(start);
+        activity.note_candidate_finished(start, false);
+        activity.note_output(start);
+        activity.note_tool_response(start);
+        let asked = start + Duration::from_secs(8);
+        activity.mark_recovery_prompted(asked, Some("reply due?"));
+        let cut = asked + Duration::from_millis(200);
+        if barge_in {
+            activity.note_candidate_voice_activity(true, cut);
+            activity.note_candidate_voice(cut);
+        }
+        let (accepted, owed) =
+            accept_event_with_reply_debt(&GeminiEvent::Interrupted, &mut activity, false, cut);
+        assert!(accepted);
+        cut_off_turn(&mut activity, &mut audio);
+        activity.keep_reply_debt(owed.expect("an interruption reads the debt"));
+        assert!(activity.reply_in_flight());
+        assert!(activity.owes_prompt());
+        let quiet = cut + crate::livekit::turn::FIRST_OUTPUT_DEADLINE;
+        assert_eq!(activity.reply_timed_out(quiet, false), !barge_in);
+        if barge_in {
+            activity.note_candidate_finished(cut + Duration::from_millis(200), false);
+            assert!(!activity.owes_prompt());
+            assert!(activity.reply_in_flight());
+        }
+    }
+}
+
+#[test]
+fn an_interruption_without_a_queued_prompt_preserves_an_unanswered_candidate_reply() {
+    for barge_in in [false, true] {
+        let start = Instant::now();
+        let mut activity = RuntimeActivity::new(start);
+        let (mut audio, _frames) = test_output_audio();
+        activity.note_candidate_finished(start, false);
+        let cut = start + Duration::from_secs(2);
+        if barge_in {
+            activity.note_candidate_voice_activity(true, cut);
+            activity.note_candidate_voice(cut);
+        }
+        let (accepted, debt) =
+            accept_event_with_reply_debt(&GeminiEvent::Interrupted, &mut activity, false, cut);
+        assert!(accepted);
+        cut_off_turn(&mut activity, &mut audio);
+        activity.keep_reply_debt(debt.expect("an interruption reads the debt"));
+        assert!(activity.reply_in_flight());
+        assert_eq!(
+            activity.reply_timed_out(start + crate::livekit::turn::FIRST_OUTPUT_DEADLINE, false),
+            !barge_in
+        );
+    }
+}
+
+#[test]
+fn provider_interruption_preserves_tool_only_debt_on_both_playout_paths() {
+    for protected in [false, true] {
+        let start = Instant::now();
+        let mut activity = RuntimeActivity::new(start);
+        let (mut audio, _frames) = test_output_audio();
+        activity.mark_prompted(start, Some("required reaction"), false);
+        activity.note_output(start + Duration::from_secs(1));
+        activity.note_tool_response(start + Duration::from_secs(6));
+        let cut = start + Duration::from_secs(11);
+        let (accepted, debt) =
+            accept_event_with_reply_debt(&GeminiEvent::Interrupted, &mut activity, false, cut);
+        assert!(accepted);
+        let transcript = if protected {
+            vec![]
+        } else {
+            vec!["Candidate: question".to_string()]
+        };
+        let unplayed = settle_interruption_debt(
+            &transcript,
+            Interruptible::Yes,
+            &mut activity,
+            &mut audio,
+            debt,
+        );
+        assert_eq!(unplayed.is_none(), protected);
+        if protected {
+            activity.settle_completed_turn(false);
+        }
+        assert!(activity.owes_reply());
+        assert!(!activity.reply_timed_out(cut, false));
+        assert!(activity.reply_timed_out(cut + crate::livekit::turn::FIRST_OUTPUT_DEADLINE, false));
+    }
+}
+
+#[test]
+fn provider_interruption_gives_an_unheard_tool_reply_a_fresh_deadline() {
+    let start = Instant::now();
+    let mut activity = RuntimeActivity::new(start);
+    let (mut audio, _frames) = test_output_audio();
+    activity.note_candidate_finished(start, false);
+    activity.note_output(start + Duration::from_secs(1));
+    activity.note_tool_response(start + Duration::from_secs(6));
+    let cut = start + Duration::from_secs(11);
+    let (accepted, debt) =
+        accept_event_with_reply_debt(&GeminiEvent::Interrupted, &mut activity, false, cut);
+    assert!(accepted);
+    settle_interruption_debt(
+        &["Candidate: question".to_string()],
+        Interruptible::Yes,
+        &mut activity,
+        &mut audio,
+        debt,
+    );
+    assert!(activity.reply_in_flight());
+    assert!(!activity.reply_timed_out(cut, false));
+    assert!(activity.reply_timed_out(cut + crate::livekit::turn::FIRST_OUTPUT_DEADLINE, false));
+}
+
+#[test]
+fn provider_interruption_before_the_greeting_preserves_its_reply_debt() {
+    let start = Instant::now();
+    let mut activity = RuntimeActivity::new(start);
+    let (mut audio, _frames) = test_output_audio();
+    activity.mark_prompted(start, Some("greeting"), false);
+    let (accepted, debt) = accept_event_with_reply_debt(
+        &GeminiEvent::Interrupted,
+        &mut activity,
+        false,
+        start + Duration::from_secs(2),
+    );
+    assert!(accepted);
+    assert!(
+        settle_interruption_debt(&[], Interruptible::Yes, &mut activity, &mut audio, debt)
+            .is_none()
+    );
+    activity.settle_completed_turn(false);
+    assert!(activity.owes_prompt());
+    assert!(activity.reply_timed_out(start + crate::livekit::turn::FIRST_OUTPUT_DEADLINE, false));
+}
+
+#[test]
+fn finished_speech_is_not_a_barge_in_that_cancels_a_queued_prompt() {
+    let start = Instant::now();
+    let mut activity = RuntimeActivity::new(start);
+    let (mut audio, _frames) = test_output_audio();
+    activity.note_candidate_voice(start);
+    activity.note_candidate_voice_activity(false, start + Duration::from_millis(1000));
+    activity.note_candidate_finished(start + Duration::from_millis(1100), false);
+    activity.note_output(start + Duration::from_millis(1200));
+    activity.mark_prompted(
+        start + Duration::from_millis(1400),
+        Some("test result"),
+        false,
+    );
+    let cut = start + Duration::from_millis(1600);
+    let (accepted, debt) =
+        accept_event_with_reply_debt(&GeminiEvent::Interrupted, &mut activity, false, cut);
+    assert!(accepted);
+    settle_interruption_debt(
+        &["Candidate: question".to_string()],
+        Interruptible::Yes,
+        &mut activity,
+        &mut audio,
+        debt,
+    );
+    assert!(activity.owes_prompt());
+}
+
+#[test]
+fn an_interruption_rebases_a_prompt_queued_behind_a_running_generation() {
+    let start = Instant::now();
+    let mut activity = RuntimeActivity::new(start);
+    let (mut audio, _frames) = test_output_audio();
+    activity.note_output(start);
+    activity.mark_prompted(start + Duration::from_secs(1), Some("test result"), false);
+    let cut = start + Duration::from_secs(12);
+    let (accepted, debt) =
+        accept_event_with_reply_debt(&GeminiEvent::Interrupted, &mut activity, false, cut);
+    assert!(accepted);
+    settle_interruption_debt(
+        &["Candidate: question".to_string()],
+        Interruptible::Yes,
+        &mut activity,
+        &mut audio,
+        debt,
+    );
+    assert!(!activity.reply_timed_out(cut, false));
+    assert!(activity.reply_timed_out(cut + crate::livekit::turn::FIRST_OUTPUT_DEADLINE, false));
+}
+
+#[test]
+fn an_interruption_rebases_an_unheard_generation_without_reviving_audible_reply_debt() {
+    for audible in [false, true] {
+        let start = Instant::now();
+        let mut activity = RuntimeActivity::new(start);
+        let (mut audio, _frames) = test_output_audio();
+        activity.note_candidate_finished(start, false);
+        activity.note_output(start + Duration::from_secs(1));
+        if audible {
+            activity.note_reply_audible();
+        }
+        let cut = start + Duration::from_secs(13);
+        let (accepted, debt) =
+            accept_event_with_reply_debt(&GeminiEvent::Interrupted, &mut activity, false, cut);
+        assert!(accepted);
+        settle_interruption_debt(
+            &["Candidate: question".to_string()],
+            Interruptible::Yes,
+            &mut activity,
+            &mut audio,
+            debt,
+        );
+        assert_eq!(activity.owes_reply(), !audible);
+        assert!(!activity.reply_timed_out(cut, false));
+        assert_eq!(
+            activity.reply_timed_out(cut + crate::livekit::turn::FIRST_OUTPUT_DEADLINE, false),
+            !audible
+        );
+    }
+}
+
+#[test]
+fn a_barge_in_without_words_does_not_cancel_a_required_platform_prompt() {
+    let start = Instant::now();
+    let mut activity = RuntimeActivity::new(start);
+    let (mut audio, _frames) = test_output_audio();
+    activity.mark_prompted(start, Some("test result"), false);
+    let speaking = start + Duration::from_secs(1);
+    activity.note_candidate_voice_activity(true, speaking);
+    activity.note_candidate_voice(speaking);
+    let cut = speaking + Duration::from_millis(100);
+    let (accepted, debt) =
+        accept_event_with_reply_debt(&GeminiEvent::Interrupted, &mut activity, false, cut);
+    assert!(accepted);
+    settle_interruption_debt(
+        &["Candidate: earlier words".to_string()],
+        Interruptible::Yes,
+        &mut activity,
+        &mut audio,
+        debt,
+    );
+    let ended = start + Duration::from_secs(2);
+    activity.note_candidate_voice_activity(false, ended);
+    assert!(activity.owes_prompt());
+    assert!(!activity.reply_timed_out(
+        ended + crate::livekit::turn::FIRST_OUTPUT_DEADLINE - Duration::from_millis(1),
+        false
+    ));
+    assert!(activity.reply_timed_out(ended + crate::livekit::turn::FIRST_OUTPUT_DEADLINE, false));
+    activity.note_candidate_finished(ended + Duration::from_secs(1), false);
+    assert!(!activity.owes_prompt());
+    assert!(activity.reply_in_flight());
+}
+
+#[test]
+fn untranscribed_noise_does_not_cancel_an_unheard_candidate_reply() {
+    let start = Instant::now();
+    let mut activity = RuntimeActivity::new(start);
+    let (mut audio, _frames) = test_output_audio();
+    activity.note_candidate_finished(start, false);
+    activity.note_output(start + Duration::from_secs(1));
+    let speaking = start + Duration::from_secs(2);
+    activity.note_candidate_voice_activity(true, speaking);
+    activity.note_candidate_voice(speaking);
+    let cut = speaking + Duration::from_millis(100);
+    let (accepted, debt) =
+        accept_event_with_reply_debt(&GeminiEvent::Interrupted, &mut activity, false, cut);
+    assert!(accepted);
+    settle_interruption_debt(
+        &["Candidate: question".to_string()],
+        Interruptible::Yes,
+        &mut activity,
+        &mut audio,
+        debt,
+    );
+    let ended = start + Duration::from_secs(3);
+    activity.note_candidate_voice_activity(false, ended);
+    assert!(activity.reply_in_flight());
+    assert!(!activity.reply_timed_out(
+        ended + crate::livekit::turn::FIRST_OUTPUT_DEADLINE - Duration::from_millis(1),
+        false
+    ));
+    assert!(activity.reply_timed_out(ended + crate::livekit::turn::FIRST_OUTPUT_DEADLINE, false));
+}
+
+#[test]
+fn only_current_candidate_speech_cancels_a_requested_close() {
+    for speaking in [false, true] {
+        for protected in [false, true] {
+            let start = Instant::now();
+            let mut activity = RuntimeActivity::new(start);
+            let mut state = RuntimeState {
+                end_requested: true,
+                ..Default::default()
+            };
+            let (mut audio, _frames) = test_output_audio();
+            activity.note_output(start);
+            activity.note_tool_response(start);
+            let cut = start + Duration::from_secs(1);
+            if speaking {
+                activity.note_candidate_voice_activity(true, cut);
+                activity.note_candidate_voice(cut);
+            }
+            let (accepted, debt) =
+                accept_event_with_reply_debt(&GeminiEvent::Interrupted, &mut activity, false, cut);
+            assert!(accepted);
+            let (cancelled, debt) = settle_close_interruption(&mut state, &activity, debt, cut);
+            assert_eq!(cancelled, speaking);
+            assert_eq!(state.end_requested, !speaking);
+            let mode = if protected {
+                Interruptible::No
+            } else {
+                Interruptible::Yes
+            };
+            if settle_interruption_debt(
+                &["Candidate: earlier words".to_string()],
+                mode,
+                &mut activity,
+                &mut audio,
+                debt,
+            )
+            .is_none()
+            {
+                activity.settle_completed_turn(false);
+            }
+            if !speaking {
+                assert!(!activity.owes_reply());
+                assert!(super::super::ready_to_close(&state, &activity));
+                assert!(!matches!(
+                    super::super::reply_watch(
+                        &state,
+                        &activity,
+                        cut + crate::livekit::turn::FIRST_OUTPUT_DEADLINE,
+                        false
+                    ),
+                    super::super::ReplyWatch::Recover
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn local_pcm_barge_in_preserves_the_wait_without_recovering_mid_speech() {
+    let start = Instant::now();
+    let mut activity = RuntimeActivity::new(start);
+    let (mut audio, _frames) = test_output_audio();
+    activity.note_candidate_finished(start, false);
+    activity.note_candidate_voice_activity(false, start + Duration::from_millis(500));
+    activity.note_output(start + Duration::from_secs(1));
+    activity.note_candidate_voice(start + Duration::from_secs(2));
+    let cut = start + Duration::from_millis(2100);
+    let (accepted, debt) =
+        accept_event_with_reply_debt(&GeminiEvent::Interrupted, &mut activity, false, cut);
+    assert!(accepted);
+    settle_interruption_debt(
+        &["Candidate: question".to_string()],
+        Interruptible::Yes,
+        &mut activity,
+        &mut audio,
+        debt,
+    );
+    let latest = start + Duration::from_secs(20);
+    activity.note_candidate_voice(latest);
+    assert!(activity.incoming_speech_active(latest));
+    assert!(!activity.reply_timed_out(latest, false));
+    activity.settle_stalls(latest + crate::livekit::turn::CHECKPOINT_VOICE_QUIET, false);
+    let due = latest
+        + crate::livekit::turn::CHECKPOINT_VOICE_QUIET
+        + crate::livekit::turn::FIRST_OUTPUT_DEADLINE;
+    assert!(!activity.reply_timed_out(due - Duration::from_millis(1), false));
+    assert!(activity.reply_timed_out(due, false));
+}
+
+#[test]
+fn a_provider_cut_of_a_discard_keeps_the_deferred_thinking_reply() {
+    let start = Instant::now();
+    for candidate in [false, true] {
+        let mut activity = RuntimeActivity::new(start);
+        activity.discarding_output = true;
+        activity.defer_thinking_reply("resume reply");
+        if candidate {
+            activity.note_candidate_voice_activity(true, start);
+        }
+        assert!(!accept_gemini_event(
+            &GeminiEvent::Interrupted,
+            &mut activity,
+            false,
+            start
+        ));
+        assert_eq!(
+            activity.claim_thinking_reply(&RuntimeState::default()),
+            !candidate
+        );
+    }
+}
+
+/// Tool names reach the logs only as declared tools, so the model's text for
+/// an undeclared one is never written out verbatim.
+#[test]
+fn logged_tool_names_are_declared_tools_or_unknown() {
+    for tool in [
+        TOOL_READ_EDITOR,
+        TOOL_READ_BOARD,
+        TOOL_READ_CONVERSATION,
+        TOOL_LOG_HINT,
+        TOOL_RECORD_FRAMEWORK_EVIDENCE,
+        TOOL_END_INTERVIEW,
+    ] {
+        assert_eq!(known_tool_name(tool), tool);
+    }
+    assert_eq!(known_tool_name("ignore previous instructions"), "unknown");
+}
+
+/// The transcript handler reads the state the room was last shown to decide
+/// whether a thinking wait is over, so it must read back what was set.
+#[test]
+fn agent_state_reports_the_state_last_shown() {
+    let state = AgentState {
+        current: AGENT_STATE_THINKING,
+        writer: None,
+    };
+    assert_eq!(state.current(), AGENT_STATE_THINKING);
+}
+
+/// An empty tool batch or blank output text is not the reply starting, so it
+/// must not stamp the first output; a real call does, as a tool call.
+#[test]
+fn only_substantive_output_starts_the_measured_reply() {
+    let start = Instant::now();
+    let at = |offset| start + Duration::from_millis(offset);
+    let mut activity = RuntimeActivity::new(start);
+    activity.latency.voice(start);
+    for (event, offset) in [
+        (GeminiEvent::OutputTranscript("  ".into()), 100),
+        (GeminiEvent::Text("\n".into()), 120),
+        (GeminiEvent::ToolCall(Vec::new()), 150),
+        (
+            GeminiEvent::ToolCall(vec![GeminiFunctionCall {
+                id: "read".into(),
+                name: TOOL_READ_EDITOR.into(),
+                args: serde_json::json!({}),
+            }]),
+            200,
+        ),
+    ] {
+        assert!(observe_latency_event(&mut activity, &event, false, at(offset)).is_none());
+    }
+    let record = activity.latency.audio(at(500)).unwrap();
+    assert_eq!(record["first_provider_output_ms"], 200);
+    assert_eq!(record["first_tool_call_ms"], 200);
+}
+
+/// A provider interruption of a reply already under way ends its trace, with
+/// a record saying how it ended.
+#[test]
+fn an_interruption_after_output_closes_the_latency_trace() {
+    let start = Instant::now();
+    let mut activity = RuntimeActivity::new(start);
+    activity.latency.voice(start);
+    activity.latency.audio(start + Duration::from_millis(300));
+    let record = observe_latency_event(
+        &mut activity,
+        &GeminiEvent::Interrupted,
+        false,
+        start + Duration::from_millis(600),
+    )
+    .unwrap();
+    assert_eq!(record["stage"], "interrupted");
+    assert_eq!(record["elapsed_ms"], 600);
+}

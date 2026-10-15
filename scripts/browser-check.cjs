@@ -2321,6 +2321,10 @@ PatternLexicon.prototype.search = function(word) {
                 candidateSegmentCount,
                 agentAfterCandidate,
                 rustAgentParticipants,
+                latencyLog: (agentOutput.join("") + "\n" + readServerLog())
+                  .split("\n")
+                  .filter((line) => line.includes("codetrial latency "))
+                  .join("\n"),
                 report,
               },
               null,

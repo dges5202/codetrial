@@ -92,6 +92,14 @@ pub(super) const CODE_SETTLE: Duration = Duration::from_secs(10);
 /// itself, from an older checkpoint than an orderly replacement resumes.
 pub(super) const PROMPT_STALL: Duration = Duration::from_secs(20);
 
+/// How long a reply somebody is waiting on may go with nothing at all back
+/// before the socket is replaced: the default of
+/// `CODETRIAL_GEMINI_FIRST_OUTPUT_S`, which an interview reads once into
+/// `RuntimeActivity::first_output_deadline`. `reply_timeout` is sized for
+/// replies that started and are still going, not for ones that never begin.
+pub(super) const FIRST_OUTPUT_DEADLINE: Duration =
+    Duration::from_secs(crate::config::DEFAULT_GEMINI_FIRST_OUTPUT_S as u64);
+
 /// How long after Thinking is chosen a transcript is still taken as the tail
 /// of what came before it. With the audio stream ended at the click, Gemini
 /// delivered that transcript about 0.3s later in a measured session.
@@ -130,24 +138,28 @@ pub(super) const REPLY_WAIT_SHOWN: Duration = Duration::from_secs(4);
 /// question already answered once the candidate goes quiet.
 pub(super) const LATE_TRANSCRIPT_GRACE: Duration = Duration::from_secs(2);
 
+/// The waits a cut clears, read before it so a cut nobody asked for can put
+/// them back.
+pub(super) struct ReplyDebt {
+    awaiting_since: Option<Instant>,
+    incoming_speech_owed: bool,
+    prompted_at: Option<Instant>,
+    unvoiced_prompt_at: Option<Instant>,
+    recovery_prompt: bool,
+}
+
 pub(super) struct RuntimeActivity {
     pub(super) turn_timing: super::timing::TurnTiming,
+    pub(super) latency: super::latency::ReplyLatency,
     pub(super) last_code_change: Instant,
     /// The substantive revision and language last delivered silently or in a
     /// briefing; the code itself is `RuntimeState::code_shown`.
     pub(super) silent_editor_delivery: Option<(u64, String)>,
     pub(super) last_user_speech: Instant,
     /// When the candidate stopped talking and started waiting, if they have and
-    /// the reply has not begun. Separate from `last_user_speech`, which the
-    /// nudge logic needs seeded at the interview start and never absent.
-    ///
-    /// Sharing one field is what made the reply-latency line lie. `Interrupted`
-    /// hands the floor back without ever saying when the candidate finished, so
-    /// a reply that followed one measured from whatever the seed was: on the
-    /// first turn that is the start of the interview, which is how a candidate
-    /// who waited under a second was reported as having waited fifteen.
-    ///
-    /// Read as liveness as well as latency; see `reply_in_flight`.
+    /// the reply has not begun: the candidate reply's deadline origin, which
+    /// generation cuts and speech boundaries may rebase. Read as liveness; see
+    /// `reply_in_flight`.
     pub(super) awaiting_reply_since: Option<Instant>,
     /// When a prompt went out that Gemini has produced nothing for yet. The
     /// other half of what the interviewer owes: `awaiting_reply_since` covers a
@@ -155,6 +167,12 @@ pub(super) struct RuntimeActivity {
     /// briefing sent in text. Outlives the stall release in `settle_stalls`,
     /// which gives the floor back without pretending the reply arrived.
     pub(super) prompted_at: Option<Instant>,
+    /// The prompt behind `prompted_at` is a recovery, a replacement's briefing
+    /// or a reply check, which `expired_reply_wait` gives at least the default
+    /// first-output deadline.
+    recovery_prompt: bool,
+    /// Required prompt still awaiting its first audio chunk.
+    pub(super) unvoiced_prompt_at: Option<Instant>,
     /// The prompt behind `prompted_at` accepts silence as an answer, as an
     /// editor review does. It still holds the floor until output or a stall,
     /// but a replacement socket does not owe the candidate anything for it.
@@ -253,6 +271,8 @@ pub(super) struct RuntimeActivity {
     pub(super) pending_round_transition: Option<ParkedPacket>,
     /// Fixed when the interview starts, like the review quota.
     pub(super) reply_timeout: Duration,
+    /// Fixed with `reply_timeout`, and held to it: see `expired_reply_wait`.
+    pub(super) first_output_deadline: Duration,
     /// A tool response went out on this socket and its generation has not come
     /// back. Distinct from `awaiting_reply_since`, which a barge-in also stamps
     /// while Gemini owes nothing: this is generation already paid for, and
@@ -568,9 +588,15 @@ impl RuntimeActivity {
     /// provider's context and so its baseline, or a cut in its first turn
     /// would have nothing to be measured against; a cold one starts over.
     pub(super) fn reset_context_observations(&mut self, resumed: bool) {
+        // Logged under the socket it ended on; the reply it owes, if any,
+        // continues on the new one.
+        self.latency
+            .close(super::latency::Boundary::SocketReplaced, Instant::now());
+        self.latency.set_socket(self.live_socket);
         self.tool_usage_this_turn = false;
         self.tool_prompt_tokens = 0;
         if !resumed {
+            self.latency.forget_context();
             self.peak_prompt_tokens = 0;
             self.comparable_prompt_tokens = 0;
             self.tool_prompt_bound = 0;
@@ -625,7 +651,7 @@ impl RuntimeActivity {
     }
 
     pub(super) fn incoming_speech_active(&self, now: Instant) -> bool {
-        self.candidate_voice_active && self.recent_voiced_pcm(now)
+        (self.candidate_voice_active || self.incoming_speech_owed) && self.recent_voiced_pcm(now)
     }
 
     // A stale VAD edge cannot renew the wait without microphone evidence.
@@ -692,6 +718,8 @@ impl RuntimeActivity {
             last_user_speech: now,
             awaiting_reply_since: None,
             prompted_at: None,
+            recovery_prompt: false,
+            unvoiced_prompt_at: None,
             prompt_allows_silence: false,
             prompt_behind_turn: false,
             prompt_text: None,
@@ -727,6 +755,7 @@ impl RuntimeActivity {
             live_usage: crate::gemini::TokenUsage::default(),
             live_socket: 1,
             live_session_id: 0,
+            latency: super::latency::ReplyLatency::default(),
             live_exit: super::LiveOutcome::Ok,
             latest_prompt_tokens: None,
             peak_prompt_tokens: 0,
@@ -755,12 +784,19 @@ impl RuntimeActivity {
             phase_judge: super::SideCall::default(),
             pending_round_transition: None,
             reply_timeout: REPLY_TIMEOUT,
+            first_output_deadline: FIRST_OUTPUT_DEADLINE,
         }
     }
 
     /// The operator's reply timeout, in place of the default.
     pub(super) fn with_reply_timeout(mut self, reply_timeout: Duration) -> Self {
         self.reply_timeout = reply_timeout;
+        self
+    }
+
+    /// The operator's first-output deadline, in place of the default.
+    pub(super) fn with_first_output_deadline(mut self, deadline: Duration) -> Self {
+        self.first_output_deadline = deadline;
         self
     }
 
@@ -778,10 +814,28 @@ impl RuntimeActivity {
     /// unanswered: the prompt itself, or `None` for one with nothing of its own
     /// to name.
     pub(super) fn mark_prompted(&mut self, now: Instant, text: Option<&str>, allows_silence: bool) {
+        self.latency.prompt(now);
+        self.mark_prompted_state(now, text, allows_silence, false);
+    }
+
+    pub(super) fn mark_recovery_prompted(&mut self, now: Instant, text: Option<&str>) {
+        self.latency.recovery_prompt(now);
+        self.mark_prompted_state(now, text, false, true);
+    }
+
+    fn mark_prompted_state(
+        &mut self,
+        now: Instant,
+        text: Option<&str>,
+        allows_silence: bool,
+        recovery: bool,
+    ) {
+        self.recovery_prompt = recovery;
         self.prompt_sequence += 1;
         self.prompt_behind_turn = self.generating;
         self.mark_speaking();
         self.prompted_at = Some(now);
+        self.unvoiced_prompt_at = (!allows_silence).then_some(now);
         self.prompt_allows_silence = allows_silence;
         self.prompt_text = text.map(str::to_string);
     }
@@ -789,16 +843,20 @@ impl RuntimeActivity {
     /// Provider events can create new debt after the pause cut off the turn.
     /// Preserve that debt on resume, but exclude paused time from its deadline.
     pub(super) fn resume_reply_wait(&mut self, now: Instant) {
-        for at in [&mut self.awaiting_reply_since, &mut self.prompted_at] {
-            if at.is_some() {
-                *at = Some(now);
-            }
+        for at in [&mut self.awaiting_reply_since, &mut self.prompted_at]
+            .into_iter()
+            .flatten()
+        {
+            *at = (*at).max(now);
         }
         self.tool_response_at = self
             .tool_response_at
-            .filter(|_| self.tool_response_outstanding)
-            .map(|_| now);
-        self.last_output_at = self.last_output_at.filter(|_| self.generating).map(|_| now);
+            .filter(|_| self.tool_response_outstanding || self.generating)
+            .map(|at| at.max(now));
+        self.last_output_at = self
+            .last_output_at
+            .filter(|_| self.generating)
+            .map(|at| at.max(now));
     }
 
     /// A tool response just went out, and Gemini owes its continuation.
@@ -810,8 +868,8 @@ impl RuntimeActivity {
         self.mark_tool_usage();
         self.tool_response_at = Some(now);
         if self.generating {
-            // Keep progress after settle_stalls converts the tool debt into
-            // prompt debt and clears its separate timestamp.
+            // Keep the generation progress clock current while waiting on the
+            // tool.
             self.last_output_at = Some(now);
         }
     }
@@ -825,8 +883,10 @@ impl RuntimeActivity {
     /// answered prompt left, which the next briefing would otherwise present
     /// as unanswered.
     pub(super) fn owe_prompt(&mut self, now: Instant, text: Option<String>) {
+        self.recovery_prompt = false;
         self.prompt_text = text;
         self.prompted_at = Some(now);
+        self.unvoiced_prompt_at = Some(now);
         self.prompt_allows_silence = false;
         self.prompt_behind_turn = false;
     }
@@ -860,13 +920,15 @@ impl RuntimeActivity {
     pub(super) fn note_turn_boundary(&mut self, now: Instant) {
         self.generating = false;
         self.last_output_at = None;
+        self.tool_response_at = None;
         if std::mem::take(&mut self.prompt_behind_turn) {
+            self.clear_candidate_reply_wait();
             if let Some(at) = &mut self.prompted_at {
                 *at = now;
             }
             return;
         }
-        self.prompted_at = None;
+        self.clear_prompt_wait();
 
         // A turn Gemini completes with nothing in it is the model choosing
         // silence, which the system instruction allows, on a socket that has
@@ -874,7 +936,16 @@ impl RuntimeActivity {
         // not to give, so this settles the debt; the idle nudges, not the
         // watchdog, answer a silence that goes on. `handle_gemini_event` logs
         // it, so a report of Jim going quiet can tell this from a stall.
-        self.awaiting_reply_since = None;
+        self.clear_candidate_reply_wait();
+    }
+
+    /// The generation under way produced output, but nothing audible reached
+    /// the candidate who is waiting: the output was tool calls alone.
+    pub(super) fn answered_without_speaking(&self) -> bool {
+        self.generating
+            && self.reply_in_flight()
+            && !self.prompt_behind_turn
+            && !self.discarding_output
     }
 
     /// Whether a replaced socket leaves the interviewer owing a reply: the
@@ -933,10 +1004,13 @@ impl RuntimeActivity {
             && (stalled(self.tool_response_at) || started_and_stalled);
         if tool_released {
             self.tool_response_outstanding = false;
-            if let Some(at) = self.tool_response_at.take()
+            if let Some(at) = self.tool_response_at
                 && !self.owes_prompt()
             {
-                self.owe_prompt(at, None);
+                let unvoiced = self.unvoiced_prompt_at;
+                let text = unvoiced.and_then(|_| self.prompt_text.take());
+                self.owe_prompt(at, text);
+                self.unvoiced_prompt_at = unvoiced;
             }
         }
         Stalls {
@@ -948,8 +1022,39 @@ impl RuntimeActivity {
     /// Silence is a valid editor-review answer. Queued audio must finish;
     /// generation that stops making progress still needs recovery.
     pub(super) fn reply_timed_out(&self, now: Instant, audio_playing: bool) -> bool {
+        self.expired_reply_wait(now, audio_playing).is_some()
+    }
+
+    /// The wait that ran out, when the reply has timed out: the first-output
+    /// deadline, or `reply_timeout`.
+    pub(super) fn expired_reply_wait(&self, now: Instant, audio_playing: bool) -> Option<Duration> {
         if audio_playing || self.incoming_speech_active(now) {
-            return false;
+            return None;
+        }
+        let first_output = self.first_output_deadline.min(self.reply_timeout);
+        let expired = |since: Option<Instant>, wait: Duration| {
+            since
+                .is_some_and(|at| now.saturating_duration_since(at) >= wait)
+                .then_some(wait)
+        };
+        if self.first_output_owed() {
+            // A recovery, a replacement's briefing or a check on a reply that
+            // stalled, is never held to less than the default deadline, so a
+            // short setting cannot cut one recovery straight into the next.
+            // Only while the recovery is the newest request: a continuation or
+            // candidate turn after it is held to the configured deadline.
+            let newest = self.unstarted_requests().max();
+            let recovery_newest = self.prompted_at.is_some_and(|at| newest == Some(at));
+            let wait = if self.recovery_prompt && recovery_newest {
+                first_output
+                    .max(FIRST_OUTPUT_DEADLINE)
+                    .min(self.reply_timeout)
+            } else {
+                first_output
+            };
+            if let Some(wait) = expired(newest, wait) {
+                return Some(wait);
+            }
         }
         if self.generating {
             let progress = self
@@ -957,11 +1062,64 @@ impl RuntimeActivity {
                 .into_iter()
                 .chain(self.tool_response_at)
                 .max();
-            return progress
-                .is_some_and(|at| now.saturating_duration_since(at) >= self.reply_timeout);
+            return expired(progress, self.reply_timeout);
         }
-        self.unstarted_reply_since()
-            .is_some_and(|at| now.saturating_duration_since(at) >= self.reply_timeout)
+        expired(self.unstarted_requests().min(), self.reply_timeout)
+    }
+
+    /// Whether the newest unanswered request is held to
+    /// `first_output_deadline`: nothing is generating, or the generation
+    /// stopped at a tool response whose continuation never began. A generation
+    /// that has spoken stays
+    /// under `reply_timeout`, since its next chunk may simply be long in
+    /// coming.
+    ///
+    /// The newest, not the oldest: a prompt sent to recover a stalled reply
+    /// gets its own full wait before the socket is given up on.
+    fn first_output_owed(&self) -> bool {
+        // Gemini answers once the candidate's turn ends, and it says when that
+        // is. A pause inside the sentence leaves the microphone quiet, which
+        // `incoming_speech_active` reads as finished; an edge that never closes
+        // falls to `reply_timeout` instead. Whether anybody is waiting is
+        // `unstarted_requests`' to say.
+        !self.candidate_voice_active && (!self.generating || self.tool_response_at.is_some())
+    }
+
+    pub(super) fn candidate_interrupting(&self, now: Instant) -> bool {
+        self.candidate_voice_active
+            || (self.recent_voiced_pcm(now) && self.voiced_pcm_at > self.candidate_voice_ended_at)
+    }
+
+    /// A provider interruption preserves unanswered work. A canceled
+    /// generation gets a fresh deadline; the latency trace has its own input
+    /// clock. New words supersede the old request; acoustic activity alone
+    /// cannot tell a new question from a cough.
+    pub(super) fn debt_past_interruption(&self, now: Instant) -> ReplyDebt {
+        ReplyDebt {
+            awaiting_since: self
+                .awaiting_reply_since
+                .map(|at| if self.generating { now } else { at }),
+            incoming_speech_owed: self.incoming_speech_owed
+                || (self.candidate_interrupting(now) && self.reply_unfinished()),
+            prompted_at: self.unvoiced_prompt_at.map(|at| {
+                if self.generating {
+                    now
+                } else {
+                    self.prompted_at.unwrap_or(at).max(at)
+                }
+            }),
+            unvoiced_prompt_at: self.unvoiced_prompt_at,
+            recovery_prompt: self.recovery_prompt,
+        }
+    }
+
+    /// Restores what `debt_past_interruption` read before a cut cleared it.
+    pub(super) fn keep_reply_debt(&mut self, debt: ReplyDebt) {
+        self.awaiting_reply_since = debt.awaiting_since;
+        self.incoming_speech_owed |= debt.incoming_speech_owed;
+        self.prompted_at = debt.prompted_at;
+        self.unvoiced_prompt_at = debt.unvoiced_prompt_at;
+        self.recovery_prompt = debt.recovery_prompt;
     }
 
     /// The candidate has waited `REPLY_WAIT_SHOWN` in silence: for a reply
@@ -1000,6 +1158,11 @@ impl RuntimeActivity {
     /// The oldest reply still owed with no output toward it: a candidate turn,
     /// a prompt silence does not answer, or a tool continuation.
     fn unstarted_reply_since(&self) -> Option<Instant> {
+        self.unstarted_requests().min()
+    }
+
+    /// When each reply still owed with no output toward it was asked for.
+    fn unstarted_requests(&self) -> impl Iterator<Item = Instant> {
         [
             self.awaiting_reply_since,
             self.prompted_at.filter(|_| !self.prompt_allows_silence),
@@ -1008,25 +1171,33 @@ impl RuntimeActivity {
         ]
         .into_iter()
         .flatten()
-        .min()
     }
 
     /// Gemini owes a reply it has not begun to deliver.
     ///
-    /// The second reader of `awaiting_reply_since`, and the reason its
-    /// lifecycle is no longer only a metric's business: a `GoAway` weighs this
-    /// before replacing the transport, because `Floor::Speaking` is stamped on
-    /// the first audio chunk and so does not cover a turn that has issued a
-    /// tool call and produced nothing yet. Tightening when the stamp is cleared
-    /// now also changes when a socket is replaced.
+    /// A `GoAway` weighs this before replacing the transport, because
+    /// `Floor::Speaking` is stamped on the first audio chunk and does not cover
+    /// a turn that has issued a tool call and produced nothing audible.
     pub(super) fn reply_in_flight(&self) -> bool {
         self.awaiting_reply_since.is_some()
+    }
+
+    pub(super) fn clear_prompt_wait(&mut self) {
+        self.prompted_at = None;
+        self.unvoiced_prompt_at = None;
+    }
+
+    pub(super) fn clear_candidate_reply_wait(&mut self) {
+        self.awaiting_reply_since = None;
     }
 
     /// The first audible chunk of a reply went out: the wait it answered is
     /// over, and the floor is the agent's until its turn completes.
     pub(super) fn note_reply_audible(&mut self) {
-        self.awaiting_reply_since = None;
+        if !self.prompt_behind_turn {
+            self.unvoiced_prompt_at = None;
+        }
+        self.clear_candidate_reply_wait();
         self.mark_speaking();
     }
 
@@ -1047,13 +1218,24 @@ impl RuntimeActivity {
         self.last_agent_speech = Instant::now();
     }
 
+    pub(super) fn note_latency_transcript(&mut self, now: Instant) {
+        if !self.is_late_transcript(now) {
+            self.latency.transcript(now);
+        }
+    }
+
+    fn is_late_transcript(&self, now: Instant) -> bool {
+        self.turn_completed_at
+            .is_some_and(|at| now.saturating_duration_since(at) < LATE_TRANSCRIPT_GRACE)
+    }
+
     /// Gemini has transcribed something the candidate said, so they have
     /// stopped talking and started waiting.
     ///
     /// The two stamps are not the same fact, which is why they are separate
     /// fields. `last_user_speech` feeds the idle timers and has to move on
-    /// every fragment. `awaiting_reply_since` is the start of a measurable
-    /// wait, and it exists only while there is a wait to measure.
+    /// every fragment. `awaiting_reply_since` is the start of a wait, and it
+    /// exists only while there is a wait to answer.
     ///
     /// Not armed while Gemini is producing. Input transcription lags the
     /// audio it describes, so a fragment covering the tail of what the
@@ -1085,9 +1267,7 @@ impl RuntimeActivity {
         if self.floor == Floor::AwaitingPlayout && !audio_playing {
             self.mark_listening();
         }
-        let late_tail = self
-            .turn_completed_at
-            .is_some_and(|at| now.saturating_duration_since(at) < LATE_TRANSCRIPT_GRACE);
+        let late_tail = self.is_late_transcript(now);
         if !self.generating
             && !late_tail
             && !(self.floor == Floor::AwaitingPlayout && audio_playing)
@@ -1098,7 +1278,7 @@ impl RuntimeActivity {
             // The candidate has moved on past a prompt that went unanswered, so
             // their turn is what is owed now. Left set, a replacement minutes
             // later is told to answer a prompt nobody is waiting on.
-            self.prompted_at = None;
+            self.clear_prompt_wait();
         }
     }
 
@@ -1182,6 +1362,7 @@ impl RuntimeActivity {
     ) {
         if state.settle_stale_request(now, receipt) {
             self.reply_after_thinking_discard = false;
+            self.latency.close(super::latency::Boundary::Held, now);
         }
     }
 
@@ -1189,6 +1370,7 @@ impl RuntimeActivity {
     fn declared_request(&mut self, state: &mut RuntimeState, now: Instant, receipt: u64) {
         self.reply_after_thinking_discard = false;
         state.declare_thinking(now, receipt);
+        self.latency.close(super::latency::Boundary::Held, now);
     }
 
     /// What a control packet did to a provisional request, read off the
@@ -1716,7 +1898,7 @@ pub(super) struct UnsentWatch {
 /// the macro outright.
 pub(super) struct TurnState {
     pub(super) state: RuntimeState,
-    pub(super) agent_state: String,
+    pub(super) agent_state: super::session::AgentState,
     pub(super) activity: RuntimeActivity,
     pub(super) turns: SpeakerTurns,
 }

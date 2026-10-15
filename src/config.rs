@@ -96,6 +96,14 @@ pub const DEFAULT_GEMINI_REPLY_TIMEOUT_S: u32 = 45;
 pub const MIN_GEMINI_REPLY_TIMEOUT_S: u32 = 20;
 pub const MAX_GEMINI_REPLY_TIMEOUT_S: u32 = 120;
 
+/// How long a reply nothing has started toward may go with nothing back before
+/// the Live socket is replaced. A working socket answers well inside the
+/// default, even if only with the end of a turn that chose silence; one that
+/// hangs sends nothing. Never longer than the reply timeout, which bounds every
+/// wait, and bounded below so a slow but working start is not replaced.
+pub const DEFAULT_GEMINI_FIRST_OUTPUT_S: u32 = 10;
+pub const MIN_GEMINI_FIRST_OUTPUT_S: u32 = 5;
+
 const REQUIRED_KEYS: &[&str] = &[
     "LIVEKIT_URL",
     "LIVEKIT_API_KEY",
@@ -558,6 +566,7 @@ pub struct AgentConfig {
     pub gemini_candidate_video_enabled: bool,
     pub max_interim_reviews: usize,
     pub gemini_reply_timeout_s: u32,
+    pub gemini_first_output_s: u32,
     pub pool: ProviderPool,
 }
 
@@ -747,6 +756,12 @@ pub fn load_from_pairs(
         }],
     };
 
+    let gemini_reply_timeout_s = optional_u32(
+        &values,
+        "CODETRIAL_GEMINI_REPLY_TIMEOUT_S",
+        DEFAULT_GEMINI_REPLY_TIMEOUT_S,
+    )
+    .clamp(MIN_GEMINI_REPLY_TIMEOUT_S, MAX_GEMINI_REPLY_TIMEOUT_S);
     Ok(AgentConfig {
         livekit_url,
         livekit_api_key,
@@ -773,12 +788,13 @@ pub fn load_from_pairs(
             DEFAULT_MAX_INTERIM_REVIEWS as u32,
         )
         .min(MAX_INTERIM_REVIEWS as u32) as usize,
-        gemini_reply_timeout_s: optional_u32(
+        gemini_reply_timeout_s,
+        gemini_first_output_s: optional_u32(
             &values,
-            "CODETRIAL_GEMINI_REPLY_TIMEOUT_S",
-            DEFAULT_GEMINI_REPLY_TIMEOUT_S,
+            "CODETRIAL_GEMINI_FIRST_OUTPUT_S",
+            DEFAULT_GEMINI_FIRST_OUTPUT_S,
         )
-        .clamp(MIN_GEMINI_REPLY_TIMEOUT_S, MAX_GEMINI_REPLY_TIMEOUT_S),
+        .clamp(MIN_GEMINI_FIRST_OUTPUT_S, gemini_reply_timeout_s),
         pool,
     })
 }

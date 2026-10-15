@@ -264,6 +264,8 @@ The gate ends by printing what it did not check, because several lanes are
 optional and a run that skips them still exits 0. That summary, the formatter
 chain, the git hooks, the generated problem files, and where a slow run's time
 actually goes are in [docs/development.md](docs/development.md).
+[Reply latency observability](docs/latency-observability.md) explains per-turn
+server timing, tool execution and audio queue breakdowns.
 
 ## Configuration
 
@@ -278,7 +280,8 @@ The common ones:
 | `GEMINI_LIVE_MODEL` | `gemini-3.1-flash-live-preview` | Realtime interviewer model |
 | `GEMINI_REPORT_MODEL` | `gemini-3.1-flash-lite` | Report model |
 | `CODETRIAL_MAX_INTERIM_REVIEWS` | `6` | Quiet-pause report-model reviews per interview; `0` disables them and `72` is the maximum |
-| `CODETRIAL_GEMINI_REPLY_TIMEOUT_S` | `45` | Seconds an owed interviewer reply may go without output before the Live socket is replaced (20–120); see [degradation controls](docs/provider-cost-and-degradation.md) |
+| `CODETRIAL_GEMINI_REPLY_TIMEOUT_S` | `45` | Seconds a started interviewer reply may go without further output before the Live socket is replaced (20–120); see [degradation controls](docs/provider-cost-and-degradation.md) |
+| `CODETRIAL_GEMINI_FIRST_OUTPUT_S` | `10` | Seconds an owed reply that nothing has started toward may go with nothing back before the Live socket is replaced (5–120, never above the reply timeout) |
 | `CODETRIAL_GEMINI_CANDIDATE_VIDEO_ENABLED` | `false` | Forward candidate video to Gemini, one low-resolution frame in five seconds; ignored in a whiteboard interview |
 | `CODETRIAL_COMPILER_EXPLORER_ENABLED` | `true` | Enable remote C, C++, and Java runs |
 | `CODETRIAL_MAX_CONCURRENT_INTERVIEWS` | `16` | Interviews one `web` process hosts agents for |

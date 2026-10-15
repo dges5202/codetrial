@@ -44,11 +44,11 @@ fn candidate_audio_stream(track: RtcAudioTrack) -> NativeAudioStream {
     )
 }
 
-/// Audio sent to Gemini in forty-millisecond batches of 16 kHz mono PCM16. At a
-/// hundred, the last words before the candidate stopped could wait that long
-/// for a full batch, and the endpointing clock does not start until Gemini has
-/// them; a smaller batch costs messages, not bytes.
-pub(super) const GEMINI_AUDIO_BUFFER_BYTES: usize = 1_280;
+/// Audio sent to Gemini in twenty-millisecond batches of 16 kHz mono PCM16, two
+/// of the ten-millisecond frames LiveKit delivers. The last words before the
+/// candidate stopped wait for a full batch, and the endpointing clock does not
+/// start until Gemini has them; a smaller batch costs messages, not bytes.
+pub(super) const GEMINI_AUDIO_BUFFER_BYTES: usize = 640;
 
 /// One frame in five seconds. Each frame stays in the Live context and is
 /// billed again on every later turn, and a presence check needs no more.
@@ -320,6 +320,7 @@ pub(super) async fn next_video_frame(
 }
 
 pub(super) struct OutputAudio {
+    pub(super) latency_marker: Option<(serde_json::Value, Instant)>,
     pub(super) source: NativeAudioSource,
     pub(super) sample_rate: u32,
     pub(super) pending_bytes: Vec<u8>,
@@ -329,11 +330,17 @@ pub(super) struct OutputAudio {
 }
 
 pub(super) struct QueuedOutputFrame {
+    pub(super) latency_marker: Option<(serde_json::Value, Instant)>,
     pub(super) output_cancellation: CancellationToken,
     pub(super) samples: Vec<i16>,
 }
 
 impl OutputAudio {
+    /// Frames sent to the worker and not yet taken by it.
+    pub(super) fn queued_frames(&self) -> usize {
+        self.frames.max_capacity() - self.frames.capacity()
+    }
+
     pub(super) fn new(
         source: NativeAudioSource,
         sample_rate: u32,
@@ -342,6 +349,7 @@ impl OutputAudio {
         Self {
             source,
             sample_rate,
+            latency_marker: None,
             pending_bytes: Vec::new(),
             playout_deadline: Instant::now(),
             frames,
@@ -350,11 +358,20 @@ impl OutputAudio {
     }
 
     pub(super) fn interrupt(&mut self) {
+        if let Some(record) = self.cancel_latency_marker() {
+            super::latency::log(&record);
+        }
         self.output_cancellation.cancel();
         self.output_cancellation = CancellationToken::new();
         self.source.clear_buffer();
         self.pending_bytes.clear();
         self.playout_deadline = Instant::now();
+    }
+
+    fn cancel_latency_marker(&mut self) -> Option<serde_json::Value> {
+        let marker = self.latency_marker.take()?;
+        let now = Instant::now();
+        Some(first_frame_record(marker, now, None, now))
     }
 
     pub(super) fn is_playing(&self) -> bool {
@@ -405,17 +422,22 @@ impl OutputAudio {
             let frame_duration =
                 Duration::from_secs_f64(samples_per_channel as f64 / self.sample_rate as f64);
             self.playout_deadline = self.playout_deadline.max(Instant::now()) + frame_duration;
-            self.frames
-                .try_send(QueuedOutputFrame {
-                    output_cancellation: self.output_cancellation.clone(),
-                    samples,
-                })
-                .map_err(|error| {
-                    std::io::Error::other(match error {
-                        mpsc::error::TrySendError::Full(_) => "output audio worker queue full",
-                        mpsc::error::TrySendError::Closed(_) => "output audio worker stopped",
-                    })
-                })?;
+            let frame = QueuedOutputFrame {
+                output_cancellation: self.output_cancellation.clone(),
+                samples,
+                latency_marker: self.latency_marker.take(),
+            };
+            if let Err(error) = self.frames.try_send(frame) {
+                let message = match &error {
+                    mpsc::error::TrySendError::Full(_) => "output audio worker queue full",
+                    mpsc::error::TrySendError::Closed(_) => "output audio worker stopped",
+                };
+                if let Some(marker) = error.into_inner().latency_marker {
+                    let record = enqueue_failure_record(marker, Instant::now());
+                    super::latency::log(&record);
+                }
+                return Err(std::io::Error::other(message).into());
+            }
         }
         Ok(queued)
     }
@@ -428,8 +450,13 @@ async fn output_audio_worker(
 ) {
     while let Some(frame) = frames.recv().await {
         if frame.output_cancellation.is_cancelled() {
+            if let Some(marker) = frame.latency_marker {
+                log_first_frame(marker, Instant::now(), None);
+            }
             continue;
         }
+        let marker = frame.latency_marker;
+        let dequeued_at = marker.as_ref().map(|_| Instant::now());
         let cancelled = frame.output_cancellation.cancelled();
         tokio::pin!(cancelled);
         // Ten milliseconds, as cut by `take_pcm16_frames`. See `capture`.
@@ -442,15 +469,69 @@ async fn output_audio_worker(
         };
         tokio::select! {
             result = source.capture_frame(&audio_frame) => {
+                if let (Some(marker), Some(dequeued_at)) = (marker, dequeued_at) {
+                    log_first_frame(marker, dequeued_at, Some(result.is_ok()));
+                }
                 if let Err(error) = result {
                     eprintln!("failed to publish output audio frame: {error}");
                 }
             }
             _ = &mut cancelled => {
+                if let (Some(marker), Some(dequeued_at)) = (marker, dequeued_at) {
+                    log_first_frame(marker, dequeued_at, None);
+                }
                 source.clear_buffer();
             }
         }
     }
+}
+
+/// The reply's first frame left the worker: captured, failed (`Some(false)`),
+/// or cancelled before capture (`None`), so an accepted reply never vanishes
+/// from the record without a terminal outcome.
+fn enqueue_failure_record(marker: (serde_json::Value, Instant), now: Instant) -> serde_json::Value {
+    let mut record = first_frame_record(marker, now, None, now);
+    record["stage"] = "audio_enqueue_failed".into();
+    record["enqueued"] = false.into();
+    record
+}
+
+fn log_first_frame(
+    (record, accepted_at): (serde_json::Value, Instant),
+    dequeued_at: Instant,
+    captured: Option<bool>,
+) {
+    let record = first_frame_record((record, accepted_at), dequeued_at, captured, Instant::now());
+    super::latency::log(&record);
+}
+
+fn first_frame_record(
+    (mut record, accepted_at): (serde_json::Value, Instant),
+    dequeued_at: Instant,
+    captured: Option<bool>,
+    now: Instant,
+) -> serde_json::Value {
+    let since_accepted =
+        i64::try_from(crate::agent::saturating_ms(now - accepted_at)).unwrap_or(i64::MAX);
+    let total = record["elapsed_ms"]
+        .as_i64()
+        .map(|ms| ms.saturating_add(since_accepted));
+    record["stage"] = match captured {
+        Some(_) => "native_audio_capture",
+        None => "native_audio_cancelled",
+    }
+    .into();
+    record["output_queue_ms"] =
+        crate::agent::saturating_ms(dequeued_at.saturating_duration_since(accepted_at)).into();
+    record["native_capture_ms"] =
+        crate::agent::saturating_ms(now.saturating_duration_since(dequeued_at)).into();
+    record["server_total_ms"] = total.into();
+    if let Some(observed) = record["observed_ms"].as_i64() {
+        record["observed_ms"] = observed.saturating_add(since_accepted).into();
+    }
+    record["captured"] = captured.unwrap_or(false).into();
+    record["native_queue_bound_ms"] = LIVEKIT_OUTPUT_QUEUE_MS.into();
+    record
 }
 
 /// How the agent's own voice is published.

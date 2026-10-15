@@ -3418,14 +3418,14 @@ async fn replace_after_stall(
         assert!(restart.take_if_settled(&activity, output_audio.is_playing(), Instant::now()));
     } else {
         // No advisory to spend: the watch tick's own decision is what replaces
-        // the socket, at the reply timeout and not before.
-        let just_short = start + REPLY_TIMEOUT - Duration::from_millis(1);
+        // the socket, at the first-output deadline and not before.
+        let just_short = start + FIRST_OUTPUT_DEADLINE - Duration::from_millis(1);
         assert_ne!(
             reply_watch(&state, &activity, just_short, false),
             ReplyWatch::Recover
         );
         assert_eq!(
-            reply_watch(&state, &activity, start + REPLY_TIMEOUT, false),
+            reply_watch(&state, &activity, start + FIRST_OUTPUT_DEADLINE, false),
             ReplyWatch::Recover
         );
         restart.cancel();
@@ -4037,7 +4037,7 @@ async fn settle(
 fn hold_turn(state: RuntimeState) -> TurnState {
     TurnState {
         state,
-        agent_state: String::new(),
+        agent_state: Default::default(),
         activity: RuntimeActivity::new(Instant::now()),
         turns: SpeakerTurns::default(),
     }
@@ -4205,6 +4205,7 @@ async fn releasing_into_an_open_candidate_turn_delivers_the_prompt_as_context() 
     let mut media = CandidateMedia::new();
     let result = crate::agent::DataEventResult {
         thinking_changed: Some(false),
+        yield_turn: true,
         carries_thinking_debt: true,
         ..Default::default()
     };
@@ -4229,6 +4230,9 @@ async fn releasing_into_an_open_candidate_turn_delivers_the_prompt_as_context() 
     assert_eq!(sent[0]["clientContent"]["turnComplete"], false);
     assert!(sent[0].to_string().contains("The candidate is ready."));
     assert_eq!(sent[1], crate::gemini::realtime_audio_end_message());
+    turn.activity.latency.voice(Instant::now());
+    let record = turn.activity.latency.audio(Instant::now()).unwrap();
+    assert_eq!(record["origin"], "prompt");
 }
 
 #[tokio::test]
@@ -4446,10 +4450,14 @@ fn reply_timeout_requires_unanswered_work_and_no_output() {
 fn unanswered_tool_continuation_keeps_its_timeout_after_floor_release() {
     let start = Instant::now();
     let mut activity = RuntimeActivity::new(start);
+    activity.note_output(start);
     activity.note_tool_response(start);
-    assert!(!activity.reply_timed_out(start + REPLY_TIMEOUT - Duration::from_millis(1), false));
+    assert!(!activity.reply_timed_out(
+        start + turn::FIRST_OUTPUT_DEADLINE - Duration::from_millis(1),
+        false
+    ));
     activity.settle_stalls(start + PROMPT_STALL, false);
-    assert!(activity.reply_timed_out(start + REPLY_TIMEOUT, false));
+    assert!(activity.reply_timed_out(start + turn::FIRST_OUTPUT_DEADLINE, false));
     assert!(activity.owes_reply());
 }
 
@@ -4458,9 +4466,13 @@ fn a_new_candidate_turn_replaces_the_old_reply_deadline() {
     let start = Instant::now();
     let mut activity = RuntimeActivity::new(start);
     activity.mark_prompted(start, Some("old prompt"), false);
-    activity.note_candidate_finished(start + Duration::from_secs(30), false);
-    assert!(!activity.reply_timed_out(start + REPLY_TIMEOUT, false));
-    assert!(activity.reply_timed_out(start + Duration::from_secs(30) + REPLY_TIMEOUT, false));
+    let finished = start + Duration::from_secs(30);
+    activity.note_candidate_finished(finished, false);
+    assert!(!activity.reply_timed_out(
+        finished + FIRST_OUTPUT_DEADLINE - Duration::from_millis(1),
+        false
+    ));
+    assert!(activity.reply_timed_out(finished + FIRST_OUTPUT_DEADLINE, false));
 }
 
 #[test]
@@ -4487,8 +4499,8 @@ fn a_generation_that_stops_making_progress_times_out() {
     assert!(!activity.reply_timed_out(start + REPLY_TIMEOUT, true));
     activity.note_tool_response(start + Duration::from_secs(20));
     activity.settle_stalls(start + Duration::from_secs(40), false);
-    assert!(!activity.reply_timed_out(start + REPLY_TIMEOUT, false));
-    activity.last_output_at = Some(start + Duration::from_secs(30));
+    assert!(activity.reply_timed_out(start + REPLY_TIMEOUT, false));
+    activity.note_output(start + Duration::from_secs(30));
     assert!(!activity.reply_timed_out(start + Duration::from_secs(60), false));
     activity.note_turn_boundary(Instant::now());
     assert!(!activity.reply_timed_out(start + Duration::from_secs(120), false));
@@ -4677,10 +4689,10 @@ fn a_tool_stall_preserves_the_prompt_queued_behind_it() {
     assert!(activity.owes_prompt());
     let own_turn_at = activity.prompted_at.unwrap();
     assert!(!activity.reply_timed_out(
-        own_turn_at + REPLY_TIMEOUT - Duration::from_millis(1),
+        own_turn_at + FIRST_OUTPUT_DEADLINE - Duration::from_millis(1),
         false
     ));
-    assert!(activity.reply_timed_out(own_turn_at + REPLY_TIMEOUT, false));
+    assert!(activity.reply_timed_out(own_turn_at + FIRST_OUTPUT_DEADLINE, false));
 }
 
 #[test]
@@ -4800,12 +4812,13 @@ fn delayed_paused_transcription_gets_a_fresh_deadline_on_resume() {
         reply_watch(
             &state,
             &activity,
-            resumed_at + REPLY_TIMEOUT - Duration::from_millis(1),
+            resumed_at + FIRST_OUTPUT_DEADLINE - Duration::from_millis(1),
             false
         ) != ReplyWatch::Recover
     );
     assert!(
-        reply_watch(&state, &activity, resumed_at + REPLY_TIMEOUT, false) == ReplyWatch::Recover
+        reply_watch(&state, &activity, resumed_at + FIRST_OUTPUT_DEADLINE, false)
+            == ReplyWatch::Recover
     );
     assert!(activity.owes_reply());
 }
@@ -4841,10 +4854,15 @@ fn resume_rebases_tool_and_generation_progress_without_creating_debt() {
     assert_eq!(activity.last_output_at, Some(resumed_at));
     assert_eq!(activity.tool_response_at, Some(resumed_at));
     assert!(activity.tool_response_outstanding);
-    assert!(
-        !activity.reply_timed_out(resumed_at + REPLY_TIMEOUT - Duration::from_millis(1), false)
-    );
-    assert!(activity.reply_timed_out(resumed_at + REPLY_TIMEOUT, false));
+    assert!(!activity.reply_timed_out(
+        resumed_at + turn::FIRST_OUTPUT_DEADLINE - Duration::from_millis(1),
+        false
+    ));
+    assert!(activity.reply_timed_out(resumed_at + turn::FIRST_OUTPUT_DEADLINE, false));
+    let progressed = resumed_at + Duration::from_secs(1);
+    activity.note_output(progressed);
+    assert!(!activity.reply_timed_out(progressed + turn::FIRST_OUTPUT_DEADLINE, false));
+    assert!(activity.reply_timed_out(progressed + REPLY_TIMEOUT, false));
 }
 
 #[tokio::test]
@@ -5091,7 +5109,7 @@ async fn a_silent_provider_is_shown_and_recovered_until_its_budget_is_spent() {
     let shown = shown_at.duration_since(start);
     assert!(shown >= REPLY_WAIT_SHOWN && shown < REPLY_WAIT_SHOWN + tick);
     let recovered = recovered.duration_since(start);
-    assert!(recovered >= REPLY_TIMEOUT && recovered < REPLY_TIMEOUT + tick);
+    assert!(recovered >= FIRST_OUTPUT_DEADLINE && recovered < FIRST_OUTPUT_DEADLINE + tick);
 
     // A timeout never counts the socket it replaces as healthy, however long it
     // stayed connected.
@@ -5134,13 +5152,13 @@ async fn a_silent_provider_is_shown_and_recovered_until_its_budget_is_spent() {
         // The replacement is as silent as the socket before it, and its own
         // deadline runs from the briefing.
         let briefed = activity.prompted_at.unwrap();
-        let just_short = briefed + REPLY_TIMEOUT - Duration::from_millis(1);
+        let just_short = briefed + FIRST_OUTPUT_DEADLINE - Duration::from_millis(1);
         assert_ne!(
             reply_watch(&state, &activity, just_short, false),
             ReplyWatch::Recover
         );
         assert_eq!(
-            reply_watch(&state, &activity, briefed + REPLY_TIMEOUT, false),
+            reply_watch(&state, &activity, briefed + FIRST_OUTPUT_DEADLINE, false),
             ReplyWatch::Recover
         );
     }
@@ -7355,4 +7373,169 @@ fn candidate_accent_preserves_original_instructions_and_voice() {
             original.instructions
         );
     }
+}
+
+#[test]
+fn a_pause_keeps_a_hold_discard_until_the_old_generation_ends() {
+    let start = Instant::now();
+    let (mut audio, _frames) = test_output_audio();
+    let mut activity = RuntimeActivity::new(start);
+    activity.note_output(start);
+    session::cut_off_for_hold(&mut activity, &mut audio);
+    assert!(activity.discarding_output);
+    let mut state = RuntimeState {
+        paused: true,
+        ..RuntimeState::default()
+    };
+    update_pause_activity(&mut state, &mut activity, &mut audio, start);
+    assert!(activity.discarding_output);
+    state.paused = false;
+    update_pause_activity(&mut state, &mut activity, &mut audio, start);
+    activity.mark_prompted(start, Some("resume"), false);
+    assert!(!accept_gemini_event(
+        &GeminiEvent::TurnComplete,
+        &mut activity,
+        false,
+        start
+    ));
+    assert!(activity.owes_prompt());
+}
+
+#[tokio::test]
+async fn a_button_hold_closes_latency_while_waiting_or_in_a_tool_only_reply() {
+    for tool_only in [false, true] {
+        let start = Instant::now();
+        let mut activity = RuntimeActivity::new(start);
+        activity.latency.voice(start);
+        activity
+            .latency
+            .voice_end(start + Duration::from_millis(100));
+        if tool_only {
+            activity
+                .latency
+                .output(start + Duration::from_millis(150), true);
+        }
+        assert_eq!(activity.floor, Floor::Listening);
+        let (mut gemini, server) = fake_resumed_socket().await;
+        begin_button_hold(
+            &mut gemini,
+            &mut Vec::new(),
+            &mut activity,
+            start + Duration::from_millis(200),
+            THINKING_TRANSCRIPT_GRACE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            crate::gemini::realtime_audio_end_message()
+        );
+        assert!(
+            activity
+                .latency
+                .boundary(
+                    latency::Boundary::TurnComplete,
+                    start + Duration::from_millis(300)
+                )
+                .is_none()
+        );
+        activity.latency.voice(start + Duration::from_secs(120));
+        let record = activity
+            .latency
+            .audio(start + Duration::from_millis(120_500))
+            .unwrap();
+        assert_eq!(record["origin"], "last_voiced_pcm");
+        assert_eq!(record["elapsed_ms"], 500);
+        assert_eq!(record["first_tool_call_ms"], serde_json::Value::Null);
+    }
+}
+
+#[tokio::test]
+async fn a_listening_floor_hold_discards_the_tool_generation_before_a_release_reply() {
+    let start = Instant::now() - Duration::from_secs(1);
+    let mut turn = hold_turn(RuntimeState::default());
+    turn.activity.latency.voice(start);
+    turn.activity
+        .latency
+        .output(start + Duration::from_millis(100), true);
+    turn.activity.note_output(Instant::now());
+    assert_eq!(turn.activity.floor, Floor::Listening);
+    let (mut output_audio, _frames) = test_output_audio();
+    let (mut gemini, server) = fake_resumed_socket().await;
+    let mut media = CandidateMedia::new();
+    settle(
+        &mut turn,
+        &mut output_audio,
+        &mut gemini,
+        &mut media,
+        &crate::agent::DataEventResult {
+            thinking_changed: Some(true),
+            ..Default::default()
+        },
+        &mut None,
+    )
+    .await;
+    assert_eq!(
+        server.await.unwrap(),
+        crate::gemini::realtime_audio_end_message()
+    );
+    let released = Instant::now();
+    turn.activity
+        .mark_prompted(released, Some("release"), false);
+    assert!(!session::accept_gemini_event(
+        &GeminiEvent::Text("old continuation".into()),
+        &mut turn.activity,
+        false,
+        released + Duration::from_millis(100)
+    ));
+    assert!(!session::accept_gemini_event(
+        &GeminiEvent::TurnComplete,
+        &mut turn.activity,
+        false,
+        released + Duration::from_millis(200)
+    ));
+    let record = turn
+        .activity
+        .latency
+        .audio(released + Duration::from_millis(500))
+        .unwrap();
+    assert_eq!(record["origin"], "prompt");
+    assert_eq!(record["elapsed_ms"], 500);
+    assert_eq!(record["first_tool_call_ms"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn thinking_release_rebases_existing_tool_continuation_waits() {
+    let start = Instant::now();
+    let mut turn = hold_turn(RuntimeState::default());
+    turn.activity.note_output(start);
+    turn.activity.note_tool_response(start);
+    let released = start + Duration::from_secs(60);
+    turn.activity.settle_stalls(released, false);
+    let (mut audio, _frames) = test_output_audio();
+    let (mut gemini, server) = fake_recording_socket(None, 1).await;
+    let mut media = CandidateMedia::new();
+    let mut board = board::Board::new();
+    let result = crate::agent::DataEventResult {
+        thinking_changed: Some(false),
+        ..Default::default()
+    };
+    let mut reply = Some("resume".to_string());
+    {
+        let mut context = turn.context(&mut audio, &mut gemini, &mut board, &mut media);
+        settle_hold(
+            &mut context,
+            &result,
+            &mut reply,
+            released,
+            THINKING_TRANSCRIPT_GRACE,
+        )
+        .await;
+    }
+    assert!(!turn.activity.reply_timed_out(released, false));
+    assert!(
+        turn.activity
+            .reply_timed_out(released + FIRST_OUTPUT_DEADLINE, false)
+    );
+    server.await.unwrap();
 }

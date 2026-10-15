@@ -46,21 +46,36 @@ replacement asks for one, so a run of sockets that each answer their briefing
 and die still ends the interview.
 
 A candidate turn, required prompt (including the opening greeting), or tool
-continuation that produces no output for 45 seconds replaces the socket even
-without a `GoAway`. `CODETRIAL_GEMINI_REPLY_TIMEOUT_S` sets that interval
-within 20 to 120 seconds. The `codetrial turn_timing` summaries record observed
-reply waits; [reply timing](turn-timing.md) defines their measurement boundaries
-and unavailable observations. A reply the watchdog replaces is paid for twice,
-so an endpoint whose slow replies do arrive warrants a longer timeout. For
-recovery, a candidate turn is timed from the last transcript fragment of it,
-and a fragment arriving within two seconds of a turn that said something is
-taken as the lagging tail of speech that turn already answered, so it owes
-nothing. The replacement, resumed or cold, carries
+continuation that gets nothing back for 10 seconds, not even the end of a turn
+that chose silence, replaces the socket even without a `GoAway`. This bounds
+sockets that stay open without answering.
+`CODETRIAL_GEMINI_FIRST_OUTPUT_S` sets that deadline within 5 to 120 seconds,
+never above the reply timeout below, for a model whose replies are slow to
+begin. The deadline waits while Gemini reports the candidate still mid-turn. A
+prompt sent after such a reply waits its own full deadline, and when Gemini
+cuts a stalled generation to take the prompt, the cut leaves the reply owed
+rather than settled, since the candidate did not cause it. A generation that
+has started and then stops producing output is given longer, 45 seconds, since
+its next chunk may simply be slow; `CODETRIAL_GEMINI_REPLY_TIMEOUT_S` sets that
+interval within 20 to 120 seconds. A recovery prompt, a replacement
+socket's briefing or a same-socket reply check, is timed from its own request
+and never given less than the default 10 seconds for its first output, so a
+shorter `CODETRIAL_GEMINI_FIRST_OUTPUT_S` cannot cut one recovery straight into
+the next. A superseding candidate turn or ordinary prompt uses the configured
+deadline again. The `codetrial turn_timing` summaries
+record observed reply waits, and [reply timing](turn-timing.md) defines their
+measurement boundaries and unavailable observations; the
+[latency records](latency-observability.md) break the server reply path into
+segments, including tool batches and output queueing. A reply the watchdog
+replaces is paid for twice, so an endpoint whose slow replies do arrive
+warrants a longer timeout. For recovery, a candidate turn is timed from the
+last transcript fragment of it, and a fragment arriving within two seconds of
+a turn that said something is taken as the lagging tail of speech that turn
+already answered, so it owes nothing. The replacement, resumed or cold, carries
 the unanswered reply across and publishes the same reconnecting state. A reply
 cut off mid-generation is owed too, and the replacement is told not to repeat
 what was already said. Optional editor reviews accept silence; queued audio and
-a paused interview do not trigger this watchdog. A generation that stops
-producing output for the same interval also recovers. Periodic nudges wait
+a paused interview do not trigger this watchdog. Periodic nudges wait
 while a reply is owed rather than replacing its debt. Until a socket has
 transcribed the candidate, the first one and every replacement alike, the idle
 timers also count the candidate's microphone level as speech, so a socket that

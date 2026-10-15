@@ -2927,7 +2927,7 @@ test("windows are computed from the states the server actually publishes", () =>
   // close paren on the same line matched no wrapped call at all, so a fourth
   // state added in the shape the formatter produces failed this open.
   const publishes = [
-    ...livekit.matchAll(/(?<!fn )set_agent_state\(([^{};]*?)\)\s*\.await/g),
+    ...livekit.matchAll(/(?<!fn )set_agent_state\(([^{};]*?)\)\s*;/g),
   ].map((match) =>
     match[1]
       .split(",")

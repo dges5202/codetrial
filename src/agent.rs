@@ -69,7 +69,8 @@ pub use prompts::{
     report_system_instruction, resume, resumed_context, rolling_assessment, round_skipped,
     round_started, silence_nudge, spoken_language, test_results_reaction,
     test_runner_unavailable_reaction, test_setup_error_reaction, time_warning,
-    uncredited_test_results_reaction, unrecorded_earlier_phases, with_owed_reply, wrap_up,
+    uncredited_test_results_reaction, unrecorded_earlier_phases, unvoiced_record_note,
+    with_owed_reply, wrap_up,
 };
 pub(crate) use prompts::{
     editor_tool_continuity, end_interview_refusal, evidenced_among, latest_candidate_continuity,
@@ -175,8 +176,8 @@ pub const THINKING_CHECK_IN_S: u64 = 120;
 pub(crate) const THINKING_RELEASE_COOLDOWN: std::time::Duration =
     std::time::Duration::from_secs(10);
 
-pub const INTERVIEW_CONTRACT_BUNDLE_VERSION: u32 = 34;
-pub const LIVE_PROMPT_VERSION: u32 = 25;
+pub const INTERVIEW_CONTRACT_BUNDLE_VERSION: u32 = 35;
+pub const LIVE_PROMPT_VERSION: u32 = 26;
 pub const REPORT_PROMPT_VERSION: u32 = 20;
 pub const RUBRIC_VERSION: u32 = 1;
 pub const REPORT_SCHEMA_VERSION: u32 = 3;

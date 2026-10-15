@@ -1,7 +1,7 @@
 # Functions the mutation gate cannot judge, because `cargo test` cannot reach
 # them. Matched against the mutant names that `cargo mutants --list` prints.
 #
-# EXCLUSIONS: 69
+# EXCLUSIONS: 71
 #
 # That number is checked by `scripts/test.sh`, so adding an entry means editing
 # this line too. The point is not the count, it is that the list only ever grows
@@ -299,6 +299,11 @@
 # builds the Google URL for `generate_phase_judgment_at`, which is tested
 # against a local server; reaching the real one needs a live key.
 #
+# `log` in the latency module and `log_first_frame` beside the output worker
+# only write a line to stderr; `()` leaves nothing a test can read. What the
+# line holds is built and tested apart from the printing: the trace's own
+# records, and `first_frame_record`.
+#
 # Keep this list short and each entry justified. An entry that is really "we
 # never got around to testing this" belongs in a test, not here.
 exclude_re = [
@@ -371,4 +376,6 @@ exclude_re = [
     "settle_phase_judge",
     "flush_framework_progress",
     "generate_phase_judgment_with_keys",
+    "livekit/latency\\.rs:.*replace log with \\(\\)$",
+    "replace log_first_frame with \\(\\)$",
 ]

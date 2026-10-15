@@ -58,7 +58,10 @@ acronym narration, announcements of work already underway or scoring details.
    uncovered edge case and a useful optimization/cleanup. Accept justified
    "already optimal".
 
-EVIDENCE CHECK — before acknowledgment or moving on, silently call
+EVIDENCE CHECK — until Coding is recorded, the platform records Repeat, Example
+and Algorithm from the candidate's own words: do not call
+`record_framework_evidence` for those three, and reply without waiting on it.
+For other phases, before acknowledgment or moving on, silently call
 `record_framework_evidence` for every supported phase; batch independent calls.
 Repeat requires accurate relevant inputs/output/rules; Example their case and
 expected behavior; Algorithm an explained approach; Optimizations grounded
@@ -257,7 +260,8 @@ can read their editor at any moment with `read_editor`.",
         read_tool_note: "- `read_editor`: to check recorded phases when asked whether a step is marked,
   or for code no [SYSTEM EVENT] or tool answer has shown you. The platform
   sends every change and says when there is none, so what you were last shown
-  is what is on screen. A cut page or an excerpt does not show the whole
+  is what is on screen; before any snapshot that is only the starter, which
+  needs no read. A cut page or an excerpt does not show the whole
   buffer: read the lines it names before claiming an implementation or
   technique is absent.",
         evidence_sources_note: "only after candidate speech, an editor snapshot,
@@ -866,7 +870,7 @@ pub fn unrecorded_earlier_phases(
     }
     state.earlier_steps_pending.extend(&missing);
     Some(format!(
-        "Unrecorded earlier step(s): {}. If the candidate already did one, record it silently before you speak; if they skipped it, record nothing. Do not reopen earlier questions; respond to the newest unanswered item.",
+        "Unrecorded earlier step(s): {}. If the candidate already did one, record it silently with your next evidence call; if they skipped it, record nothing. Do not reopen earlier questions; respond to the newest unanswered item.",
         missing.join(", ")
     ))
 }
@@ -2310,6 +2314,14 @@ Answer with JSON only: {{"steps": [{{"step": "<open step id>", "quote": "<exact
 words>", "summary": "<under 120 characters: what they said or wrote>"}}]}}.
 Use {{"steps": []}} when no open step is completed. No scores or advice."#
     )
+}
+
+/// What the interviewer is told when a turn answering the candidate called
+/// tools, usually to record evidence, and ended without a word. Silence stays
+/// its call, since quiet is right while they code; the note only stops a reply
+/// it meant to give from waiting for the candidate to speak again.
+pub fn unvoiced_record_note() -> &'static str {
+    "[SYSTEM EVENT] Your last turn answered the candidate with tool calls only and said nothing aloud. If their turn calls for a reply, give it now; otherwise stay silent."
 }
 
 /// What the interviewer is told when the phase judge records steps it did not:

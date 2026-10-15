@@ -32,9 +32,12 @@ use crate::runtime::{
 };
 
 use super::board::{self, Board};
+use super::latency::{self, Boundary};
 use super::media::{CandidateMedia, OutputAudio};
 use super::timing::TimingOutcome;
-use super::turn::{Floor, Interruptible, RuntimeActivity, SpeakerTurns, TurnState, closing_order};
+use super::turn::{
+    Floor, Interruptible, ReplyDebt, RuntimeActivity, SpeakerTurns, TurnState, closing_order,
+};
 use super::{
     AGENT_STATE_LISTENING, AGENT_STATE_SPEAKING, AGENT_STATE_THINKING, LIVEKIT_AGENT_STATE,
     NOTABLE_PLAYOUT_BACKLOG, WRAP_UP_WAIT, browser_packet, output_settled,
@@ -420,7 +423,7 @@ pub(super) struct GeminiEventContext<'a> {
     /// nothing.
     pub(super) board: &'a mut Board,
     pub(super) state: &'a mut RuntimeState,
-    pub(super) agent_state: &'a mut String,
+    pub(super) agent_state: &'a mut AgentState,
     pub(super) activity: &'a mut RuntimeActivity,
     pub(super) turns: &'a mut SpeakerTurns,
     pub(super) media: &'a mut CandidateMedia,
@@ -606,6 +609,10 @@ fn record_live_usage(
     context: &mut GeminiEventContext<'_>,
     usage: crate::gemini::TokenUsage,
 ) {
+    context
+        .activity
+        .latency
+        .observe_usage(usage.prompt, usage.tool_use_prompt);
     let line = context.activity.account_live_usage(
         room.name().as_str(),
         &super::log_clock(context.state),
@@ -655,7 +662,9 @@ pub(super) fn accept_gemini_event(
     match output_disposition(event, activity.discarding_output, held) {
         OutputDisposition::Drop => false,
         OutputDisposition::EndsTheDiscard => {
-            activity.end_discard(matches!(event, GeminiEvent::Interrupted));
+            activity.end_discard(
+                matches!(event, GeminiEvent::Interrupted) && activity.candidate_interrupting(now),
+            );
             false
         }
         OutputDisposition::Deliver => {
@@ -686,6 +695,64 @@ pub(super) fn accept_gemini_event(
     }
 }
 
+/// A declared tool's name, never the model's text for an undeclared one.
+fn known_tool_name(name: &str) -> &'static str {
+    [
+        TOOL_READ_EDITOR,
+        TOOL_READ_BOARD,
+        TOOL_READ_CONVERSATION,
+        TOOL_LOG_HINT,
+        TOOL_RECORD_FRAMEWORK_EVIDENCE,
+        TOOL_END_INTERVIEW,
+    ]
+    .into_iter()
+    .find(|tool| *tool == name)
+    .unwrap_or("unknown")
+}
+
+/// Provider milestones are when the message arrived, not when the room loop
+/// got to it, so a busy loop is not charged to Gemini.
+fn received_at(gemini: &GeminiLiveSession) -> Instant {
+    gemini.event_received_at().unwrap_or_else(Instant::now)
+}
+
+fn accept_event_with_reply_debt(
+    event: &GeminiEvent,
+    activity: &mut RuntimeActivity,
+    held: bool,
+    now: Instant,
+) -> (bool, Option<ReplyDebt>) {
+    let debt =
+        matches!(event, GeminiEvent::Interrupted).then(|| activity.debt_past_interruption(now));
+    let accepted = accept_gemini_event(event, activity, held, now);
+    (accepted, debt.filter(|_| accepted))
+}
+
+fn observe_latency_event(
+    activity: &mut RuntimeActivity,
+    event: &GeminiEvent,
+    held: bool,
+    now: Instant,
+) -> Option<serde_json::Value> {
+    // Audio is stamped where it is accepted; tools from a locally cut
+    // generation still need answers but cannot start a new measured reply.
+    if activity.discarding_output || held {
+        return None;
+    }
+    match event {
+        GeminiEvent::ToolCall(calls) if !calls.is_empty() => activity.latency.output(now, true),
+        GeminiEvent::Text(text) | GeminiEvent::OutputTranscript(text)
+            if transcript_text(text).is_some() =>
+        {
+            activity.latency.output(now, false);
+        }
+        GeminiEvent::TurnComplete => return activity.latency.boundary(Boundary::TurnComplete, now),
+        GeminiEvent::Interrupted => return activity.latency.boundary(Boundary::Interrupted, now),
+        _ => {}
+    }
+    None
+}
+
 /// Gemini said something. One arm each, because the arms share only the socket
 /// they arrived on: what a tool call has to do and what a cut-off turn has to
 /// undo have no step in common, and reading either one used to mean scrolling
@@ -710,6 +777,16 @@ pub(super) async fn handle_gemini_event(
             now,
             context.media.audio.is_some(),
         ) {
+            if !context.state.floor_held() {
+                if active {
+                    context.activity.latency.voice_start();
+                } else {
+                    context
+                        .activity
+                        .latency
+                        .voice_end(received_at(context.gemini));
+                }
+            }
             eprintln!(
                 "timing: candidate voice_activity={} at={} room={}",
                 if active { "started" } else { "ended" },
@@ -726,6 +803,12 @@ pub(super) async fn handle_gemini_event(
         && !context.activity.generating
         && context.activity.owes_reply();
 
+    // The other silence: the generation called tools, and the candidate who
+    // finished speaking still heard nothing. Left alone, Jim stays quiet until
+    // the candidate speaks again.
+    let unvoiced_tool_turn =
+        matches!(event, GeminiEvent::TurnComplete) && context.activity.answered_without_speaking();
+
     // Every completion ends a generation the provider billed and whose context
     // it may have cut, including the late one an interruption or a pause leaves
     // behind and the guard below swallows.
@@ -737,7 +820,9 @@ pub(super) async fn handle_gemini_event(
     }
     let held = context.state.floor_held();
     let discarding = context.activity.discarding_output;
-    let handled = if accept_gemini_event(&event, context.activity, held, Instant::now()) {
+    let (accepted, interruption_debt) =
+        accept_event_with_reply_debt(&event, context.activity, held, Instant::now());
+    let handled = if accepted {
         if silent_answer && !context.activity.owes_reply() {
             context.activity.turn_timing.note_model_output();
             eprintln!(
@@ -755,6 +840,12 @@ pub(super) async fn handle_gemini_event(
         if ends_turn(&event) {
             context.gemini.input_cause = None;
         }
+
+        if let Some(record) =
+            observe_latency_event(context.activity, &event, held, received_at(context.gemini))
+        {
+            latency::log(&record);
+        }
         match event {
             GeminiEvent::ToolCall(calls) => on_tool_calls(room, context, calls).await,
             GeminiEvent::OutputTranscript(text) => on_output_transcript(room, context, &text).await,
@@ -771,7 +862,9 @@ pub(super) async fn handle_gemini_event(
                 Ok(())
             }
             GeminiEvent::TurnComplete => on_turn_complete(room, context).await,
-            GeminiEvent::Interrupted => on_interruption(room, context, interruptible).await,
+            GeminiEvent::Interrupted => {
+                on_interruption(room, context, interruptible, interruption_debt).await
+            }
 
             // Named rather than left to the catch-all: the room loop intercepts
             // this before dispatching, so the only way one arrives here is
@@ -793,7 +886,9 @@ pub(super) async fn handle_gemini_event(
 
     // The reply a hold deferred is due once its discard has ended, which is
     // often the swallowed ending above, so it is asked here on both paths.
-    if handled.is_ok() && context.activity.claim_thinking_reply(context.state) {
+    let thinking_reply_due =
+        handled.is_ok() && context.activity.claim_thinking_reply(context.state);
+    if thinking_reply_due {
         let prompt =
             crate::agent::with_timer(context.state, context.activity.thinking_reply_prompt());
         context
@@ -810,6 +905,49 @@ pub(super) async fn handle_gemini_event(
         {
             eprintln!(
                 "Gemini thinking reply failed ({error}); waiting for the close to be reported"
+            );
+        }
+    }
+
+    // Not after a deferred thinking reply was just asked for, which already
+    // owes the candidate an answer, nor after `end_interview` was accepted: its
+    // response told Jim to say nothing further, and a note asking for a reply
+    // would race the closing `send_wrap_up_and_wait` is about to request.
+    let now = Instant::now();
+    if handled.is_ok()
+        && unvoiced_tool_turn
+        && !thinking_reply_due
+        && !context.state.end_requested
+        && !context.state.ended
+        && !context.state.paused
+        && !context.state.floor_held()
+        && !context.activity.incoming_speech_active(now)
+    {
+        let prompt = crate::agent::with_timer(
+            context.state,
+            crate::agent::unvoiced_record_note().to_string(),
+        );
+        eprintln!(
+            "timing: Gemini answered the candidate with tools only; asking once whether a reply is due at={} room={}",
+            log_clock(context.state),
+            room.name()
+        );
+
+        // The turn that ended cleared the candidate's wait, but they heard
+        // nothing: the note is owed an answer, if only a chosen silence, so a
+        // socket that sends nothing back is replaced rather than waited on.
+        context.activity.mark_recovery_prompted(now, Some(&prompt));
+        if let Err(error) = send_model_text(
+            context.gemini,
+            context.state,
+            ModelInputKind::Turn,
+            TurnCause::Turn,
+            &prompt,
+        )
+        .await
+        {
+            eprintln!(
+                "Gemini unvoiced-turn note failed ({error}); waiting for the close to be reported"
             );
         }
     }
@@ -843,7 +981,7 @@ fn observe_voice_activity(
 pub(super) fn settle_hold_at_turn_end(state: &mut RuntimeState, activity: &mut RuntimeActivity) {
     activity.confirm_thinking_request(state, Instant::now(), crate::current_epoch_millis());
     if state.thinking_hold.is_active() {
-        activity.awaiting_reply_since = None;
+        activity.clear_candidate_reply_wait();
     }
 }
 
@@ -859,6 +997,7 @@ async fn on_tool_calls(
     }
     let timed = !context.state.floor_held() && !context.activity.discarding_output;
     let reviewed_revision = context.activity.substantive_revision_at_last_review;
+    let tool_started = Instant::now();
     let answers = execute_timed_tool_batch(
         context.state,
         context.activity,
@@ -866,22 +1005,66 @@ async fn on_tool_calls(
         reviewed_revision,
         timed,
     );
+    let tool_execute_ms = crate::agent::saturating_ms(tool_started.elapsed());
     let editor_review_revision = answers
         .iter()
         .any(|(_, answer)| answer.get("editorReview").is_some())
         .then_some(context.state.evidence_ledger.code.substantive_revision);
+
+    // What `read_board` could not put in its own response. Once per batch, so a
+    // batch that asked twice puts the board up once, and before the responses
+    // rather than after: Gemini starts its reply as soon as it has them, so a
+    // board sent after would arrive under an answer already being spoken about
+    // the board before it, while the tool has said this one is in front of it.
+    //
+    // Not `?`: an image the socket would not take is worth a line and a turn
+    // that answers from the board it already had, not an interview ended on the
+    // write.
+    let board_started = Instant::now();
+    if std::mem::take(&mut context.state.board_resend_requested)
+        && let Err(error) = board::resend(context.board, context.gemini).await
+    {
+        eprintln!("board resend failed ({error}); waiting for the close to be reported");
+    }
+    let board_resend_ms = crate::agent::saturating_ms(board_started.elapsed());
+
+    // Not `?`. A response that did not go out is owed nothing back, so the flag
+    // stays down, and the socket it failed on is replaced when its close is
+    // reported; the checklist below still reflects the calls.
+    let send_started = Instant::now();
+    let sent = context.gemini.send_tool_responses(&answers).await;
+    let tool_send_ms = crate::agent::saturating_ms(send_started.elapsed());
+    if timed {
+        context
+            .activity
+            .turn_timing
+            .note_tool_response(send_started, Instant::now(), sent.is_ok());
+    }
+
+    // Gemini resumes the moment the responses land, so serializing them again
+    // for the lines below waits until after the send.
+    if !context.activity.discarding_output && !context.state.floor_held() {
+        let batch_ms = crate::agent::saturating_ms(tool_started.elapsed());
+        let mut timing =
+            context
+                .activity
+                .latency
+                .tool_response(Instant::now(), batch_ms, sent.is_ok());
+        timing["tool_batch_ms"] = batch_ms.into();
+        timing["tool_execute_ms"] = tool_execute_ms.into();
+        timing["board_resend_ms"] = board_resend_ms.into();
+        timing["tool_send_ms"] = tool_send_ms.into();
+        timing["tool_count"] = answers.len().into();
+        timing["tool_names"] = answers
+            .iter()
+            .map(|(call, _)| known_tool_name(&call.name))
+            .collect::<Vec<_>>()
+            .into();
+        timing["sent"] = sent.is_ok().into();
+        latency::log(&timing);
+    }
     for (call, response) in &answers {
-        let name = [
-            TOOL_READ_EDITOR,
-            TOOL_READ_BOARD,
-            TOOL_READ_CONVERSATION,
-            TOOL_LOG_HINT,
-            TOOL_RECORD_FRAMEWORK_EVIDENCE,
-            TOOL_END_INTERVIEW,
-        ]
-        .into_iter()
-        .find(|tool| *tool == call.name)
-        .unwrap_or("unknown");
+        let name = known_tool_name(&call.name);
         eprintln!(
             "codetrial live_tool_response room={} tool={name} bytes={} accepted={}",
             room.name(),
@@ -911,32 +1094,6 @@ async fn on_tool_calls(
         }
     }
 
-    // What `read_board` could not put in its own response. Once per batch, so a
-    // batch that asked twice puts the board up once, and before the responses
-    // rather than after: Gemini starts its reply as soon as it has them, so a
-    // board sent after would arrive under an answer already being spoken about
-    // the board before it, while the tool has said this one is in front of it.
-    //
-    // Not `?`: an image the socket would not take is worth a line and a turn
-    // that answers from the board it already had, not an interview ended on the
-    // write.
-    if std::mem::take(&mut context.state.board_resend_requested)
-        && let Err(error) = board::resend(context.board, context.gemini).await
-    {
-        eprintln!("board resend failed ({error}); waiting for the close to be reported");
-    }
-
-    // Not `?`. A response that did not go out is owed nothing back, so the flag
-    // stays down, and the socket it failed on is replaced when its close is
-    // reported; the checklist below still reflects the calls.
-    let started = Instant::now();
-    let sent = context.gemini.send_tool_responses(&answers).await;
-    if timed {
-        context
-            .activity
-            .turn_timing
-            .note_tool_response(started, Instant::now(), sent.is_ok());
-    }
     if let Some(revision) = editor_review_revision {
         eprintln!(
             "codetrial live_editor_review room={} revision={revision} sent={}",
@@ -996,6 +1153,7 @@ async fn on_input_transcript(
     text: &str,
     interruptible: Interruptible,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let transcript_received_at = received_at(context.gemini);
     let candidate_identity = context.media.identity.clone();
     if let (Some(_), Some(identity)) = (transcript_text(text), candidate_identity.as_deref()) {
         // The candidate is talking over audio Gemini finished producing a while
@@ -1014,8 +1172,8 @@ async fn on_input_transcript(
         // The wait the room was shown is over once the candidate talks again:
         // the floor is theirs, and the watch tick shows it again if their new
         // turn goes unanswered too.
-        if context.agent_state.as_str() == AGENT_STATE_THINKING {
-            set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING).await?;
+        if context.agent_state.current() == AGENT_STATE_THINKING {
+            set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING);
         }
         let whole = context
             .turns
@@ -1032,6 +1190,11 @@ async fn on_input_transcript(
                 crate::current_epoch_millis(),
             );
         }
+        if !context.state.floor_held() {
+            context
+                .activity
+                .note_latency_transcript(transcript_received_at);
+        }
         if !was_thinking && context.state.thinking_hold.is_active() {
             finish_turn_timing(
                 room.name().as_str(),
@@ -1042,7 +1205,7 @@ async fn on_input_transcript(
             );
             context.state.thinking_unheard_reply |= context.activity.floor != Floor::Listening;
             cut_off_for_hold(context.activity, context.output_audio);
-            set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING).await?;
+            set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING);
         } else if was_thinking
             && !context.state.thinking_hold.is_active()
             && crate::agent::thinking_owes_context(context.state)
@@ -1062,7 +1225,7 @@ async fn on_input_transcript(
                 Err(error) => {
                     context
                         .activity
-                        .mark_prompted(Instant::now(), Some(&briefing), false);
+                        .mark_recovery_prompted(Instant::now(), Some(&briefing));
                     eprintln!(
                         "Gemini thinking context failed ({error}); waiting for the close to be reported"
                     );
@@ -1117,6 +1280,9 @@ async fn on_generated_audio(
     mime_type: &str,
     interruptible: Interruptible,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let handler_started = Instant::now();
+    let mut first_audio = None;
+
     // A new turn's first chunk while the previous one is still draining.
     // `InputTranscript` normally clears the queue before this point, so
     // reaching here means Gemini answered something it never transcribed.
@@ -1128,8 +1294,42 @@ async fn on_generated_audio(
     // reply behind it.
     if context.output_audio.accepts(bytes, mime_type) {
         drop_stale_playout(room, context, interruptible).await?;
+        if !context.activity.discarding_output {
+            context
+                .activity
+                .latency
+                .output(received_at(context.gemini), false);
+        }
+        let accepted_at = Instant::now();
+        if !context.activity.discarding_output
+            && let Some(mut record) = context.activity.latency.audio(accepted_at)
+        {
+            record["provider_event_queue_ms"] = context
+                .gemini
+                .event_received_at()
+                .map(|at| {
+                    crate::agent::saturating_ms(handler_started.saturating_duration_since(at))
+                })
+                .into();
+
+            // Frames already ahead of this reply: a first frame that waits in
+            // the queue is waiting behind these, not behind the worker.
+            record["output_queue_frames"] = context.output_audio.queued_frames().into();
+            record["playout_ahead_ms"] = crate::agent::saturating_ms(
+                context
+                    .output_audio
+                    .playout_deadline
+                    .saturating_duration_since(accepted_at),
+            )
+            .into();
+            record["stale_drop_ms"] =
+                crate::agent::saturating_ms(accepted_at - handler_started).into();
+            context.output_audio.latency_marker = Some((record.clone(), accepted_at));
+            first_audio = Some((record, accepted_at));
+        }
     }
     let captured = context.output_audio.capture(bytes, mime_type).await?;
+    let enqueued_at = Instant::now();
     if let Some(summary) = context
         .activity
         .turn_timing
@@ -1149,7 +1349,17 @@ async fn on_generated_audio(
         // Speech is queued, not played: the floor stays busy until the buffered
         // audio actually finishes.
         context.activity.last_agent_speech = context.output_audio.playout_deadline;
-        set_agent_state(room, context.agent_state, AGENT_STATE_SPEAKING).await?;
+        set_agent_state(room, context.agent_state, AGENT_STATE_SPEAKING);
+    }
+
+    // Logged once the chunk is queued, so the line costs the reply nothing. The
+    // agent state write holds the loop, not the worker, which already has the
+    // first frames.
+    if let Some((mut record, accepted_at)) = first_audio {
+        record["enqueue_ms"] = crate::agent::saturating_ms(enqueued_at - accepted_at).into();
+        record["handler_tail_ms"] = crate::agent::saturating_ms(enqueued_at.elapsed()).into();
+        record["enqueued"] = captured.into();
+        latency::log(&record);
     }
     Ok(())
 }
@@ -1248,9 +1458,34 @@ async fn on_turn_complete(
         .activity
         .settle_completed_turn(context.output_audio.is_playing());
     if context.activity.floor == Floor::Listening {
-        set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING).await?;
+        set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING);
     }
     Ok(())
+}
+
+fn settle_close_interruption(
+    state: &mut RuntimeState,
+    activity: &RuntimeActivity,
+    owed: Option<ReplyDebt>,
+    now: Instant,
+) -> (bool, Option<ReplyDebt>) {
+    let cancelled =
+        activity.candidate_interrupting(now) && std::mem::take(&mut state.end_requested);
+    (cancelled, if state.end_requested { None } else { owed })
+}
+
+fn settle_interruption_debt(
+    transcript: &[String],
+    interruptible: Interruptible,
+    activity: &mut RuntimeActivity,
+    output_audio: &mut OutputAudio,
+    owed: Option<ReplyDebt>,
+) -> Option<Duration> {
+    let unplayed = cut_unless_protected(transcript, interruptible, activity, output_audio);
+    if let Some(owed) = owed {
+        activity.keep_reply_debt(owed);
+    }
+    unplayed
 }
 
 /// Gemini cut its own turn, because it heard the candidate start one.
@@ -1258,6 +1493,7 @@ async fn on_interruption(
     room: &Room,
     context: &mut GeminiEventContext<'_>,
     interruptible: Interruptible,
+    owed: Option<ReplyDebt>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // A barge-in cancels a pending close. `cut_off_turn` below clears
     // `tool_response_outstanding`, which is the only thing holding the end
@@ -1266,8 +1502,10 @@ async fn on_interruption(
     // objection, and is cut off and handed a report. Ending is the one decision
     // here nobody can take back, and someone who has just started a sentence is
     // not finished. Jim can call the tool again once they are.
-    if std::mem::take(&mut context.state.end_requested) {
-        eprintln!("interviewer's ending cancelled: the candidate spoke over the close");
+    let (cancelled_close, owed) =
+        settle_close_interruption(context.state, context.activity, owed, Instant::now());
+    if cancelled_close {
+        eprintln!("interviewer's ending cancelled: candidate speech detected");
     }
 
     // A kept turn is over as far as Gemini is concerned: it has stopped
@@ -1276,11 +1514,12 @@ async fn on_interruption(
     // loop waits for a reply that has already happened. Why a turn is kept at
     // all is on `cut_unless_protected`, and the line `on_turn_complete` prints
     // carries how much of it is still to play.
-    let Some(unplayed) = cut_unless_protected(
+    let Some(unplayed) = settle_interruption_debt(
         &context.state.transcript,
         interruptible,
         context.activity,
         context.output_audio,
+        owed,
     ) else {
         eprintln!(
             "timing: kept a turn Gemini cut: {}",
@@ -1322,25 +1561,52 @@ async fn on_interruption(
     // would read them as one line.
     close_turns(room, context).await?;
 
-    set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING).await?;
+    set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING);
     Ok(())
 }
 
-pub(super) async fn set_agent_state(
-    room: &Room,
-    current: &mut String,
-    next: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if current == next {
-        return Ok(());
+/// The state the page shows, and the one task that writes it to the room.
+///
+/// The write is a LiveKit round trip, and awaited in the room loop it held up
+/// the reply's next chunk and the microphone frames behind it just as a reply
+/// began. One writer keeps the writes in order and skips straight to the
+/// latest when they come faster than it can send. A failed write is logged and
+/// left for the next state change to correct.
+#[derive(Default)]
+pub(crate) struct AgentState {
+    current: &'static str,
+    writer: Option<tokio::sync::watch::Sender<&'static str>>,
+}
+
+impl AgentState {
+    pub(super) fn current(&self) -> &'static str {
+        self.current
     }
-    let participant = room.local_participant();
-    participant
-        .set_attributes(agent_state_attributes(participant.attributes(), next))
-        .await?;
-    current.clear();
-    current.push_str(next);
-    Ok(())
+}
+
+pub(super) fn set_agent_state(room: &Room, state: &mut AgentState, next: &'static str) {
+    if state.current == next {
+        return;
+    }
+    state.current = next;
+    let writer = state.writer.get_or_insert_with(|| {
+        let (writer, mut latest) = tokio::sync::watch::channel("");
+        let participant = room.local_participant();
+        tokio::spawn(async move {
+            // Ends with the interview, when its state is dropped.
+            while latest.changed().await.is_ok() {
+                let next = *latest.borrow_and_update();
+                if let Err(error) = participant
+                    .set_attributes(agent_state_attributes(participant.attributes(), next))
+                    .await
+                {
+                    eprintln!("agent state {next} not published: {error}");
+                }
+            }
+        });
+        writer
+    });
+    writer.send_replace(next);
 }
 
 /// How long Gemini waits through the candidate's silence before taking the
@@ -1354,7 +1620,7 @@ pub(super) const TURN_WINDOW_ATTRIBUTE: &str = "codetrial.silence_ms";
 /// round trip the room pays before it waits for the candidate.
 pub(super) async fn publish_opening_attributes(
     room: &Room,
-    current: &mut String,
+    current: &mut AgentState,
     silence_ms: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let participant = room.local_participant();
@@ -1362,8 +1628,7 @@ pub(super) async fn publish_opening_attributes(
     participant
         .set_attributes(turn_window_attributes(attributes, silence_ms))
         .await?;
-    current.clear();
-    current.push_str(AGENT_STATE_LISTENING);
+    current.current = AGENT_STATE_LISTENING;
     Ok(())
 }
 
@@ -2091,7 +2356,7 @@ pub(super) async fn send_wrap_up_and_wait(
         // The closing message is the one turn that plays to the end.
         if goodbye_heard(context.activity, context.output_audio.is_playing()) {
             context.activity.mark_listening();
-            set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING).await?;
+            set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING);
             return Ok(());
         }
         tokio::select! {
@@ -2131,7 +2396,7 @@ async fn drop_stale_playout(
         "timing: dropped {:.1}s of queued interviewer speech the candidate talked over",
         dropped.as_secs_f64()
     );
-    set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING).await?;
+    set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING);
     Ok(())
 }
 
@@ -2144,6 +2409,7 @@ pub(super) fn cut_off_for_hold(activity: &mut RuntimeActivity, output_audio: &mu
     activity.discarding_output |= pause_leaves_output_in_flight(activity, Instant::now());
     activity.stale_turn_pending |= activity.generating && !activity.discarding_output;
     cut_off_turn(activity, output_audio);
+    activity.latency.close(Boundary::Held, Instant::now());
 }
 
 /// The decision and its effect, with no room in sight so a test can reach it.
@@ -2176,9 +2442,9 @@ pub(super) fn cut_off_turn(
     // and leaving the stamp behind meant the next reply that produced audio
     // without its own transcript measured from it: the same lie this field was
     // split out of `last_user_speech` to stop telling, one turn later.
-    activity.awaiting_reply_since = None;
+    activity.clear_candidate_reply_wait();
 
-    activity.prompted_at = None;
+    activity.clear_prompt_wait();
     activity.prompt_behind_turn = false;
     activity.generating = false;
     activity.last_output_at = None;

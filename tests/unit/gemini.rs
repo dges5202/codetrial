@@ -2219,6 +2219,32 @@ fn live_setup_omits_thinking_config_for_standard_3_8() {
 }
 
 #[test]
+fn every_tool_stays_blocking_on_3_8_and_3_1_declares_no_behavior() {
+    let behaviors = |model: &str| {
+        let config = live_config(&[("GEMINI_LIVE_MODEL", model)]);
+        let boot = bootstrap(&config, "interview-fixed", Some("two-sum"), 45);
+        live_setup_message(&boot, None)["setup"]["tools"][0]["functionDeclarations"]
+            .as_array()
+            .expect("declarations")
+            .iter()
+            .map(|declaration| declaration.get("behavior").cloned())
+            .collect::<Vec<_>>()
+    };
+    let standard = behaviors("models/gemini-3.8-live");
+    assert!(!standard.is_empty());
+    assert!(
+        standard
+            .iter()
+            .all(|behavior| *behavior == Some(json!("BLOCKING")))
+    );
+    assert!(
+        behaviors("gemini-3.1-flash-live-preview")
+            .iter()
+            .all(Option::is_none)
+    );
+}
+
+#[test]
 fn live_setup_keeps_the_thinking_budget_for_other_models() {
     let config = live_config(&[("GEMINI_LIVE_MODEL", "gemini-live-2.5")]);
     let boot = bootstrap(&config, "interview-fixed", Some("two-sum"), 45);
@@ -4496,4 +4522,46 @@ fn reconnect_setup_preserves_resolved_voice_and_accent() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn queued_transcripts_keep_the_provider_receipt_time() {
+    let config = live_config(&[]);
+    let boot = bootstrap(&config, "interview-fixed", Some("two-sum"), 45);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(socket).await.unwrap();
+        socket.next().await.unwrap().unwrap();
+        for frame in [
+            r#"{"setupComplete":{}}"#,
+            r#"{"serverContent":{"inputTranscription":{"text":"finished"},"turnComplete":true}}"#,
+        ] {
+            socket.send(Message::Text(frame.into())).await.unwrap();
+        }
+        std::future::pending::<()>().await;
+    });
+    let mut session = open_live_session_at(&url, &boot, None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while session.events.len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let queued_at = std::time::Instant::now();
+    assert!(matches!(
+        session.next_event().await,
+        Some(GeminiEvent::InputTranscript(_))
+    ));
+    let transcript_at = session.event_received_at().unwrap();
+    assert!(transcript_at <= queued_at);
+    assert!(matches!(
+        session.next_event().await,
+        Some(GeminiEvent::TurnComplete)
+    ));
+    assert_eq!(session.event_received_at(), Some(transcript_at));
+    session.shutdown().await.unwrap();
+    server.abort();
 }

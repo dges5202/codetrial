@@ -594,3 +594,95 @@ fn voiced_recently_spans_the_quiet_window_only() {
     assert!(media.voiced_recently(start + Duration::from_millis(1_999)));
     assert!(!media.voiced_recently(start + super::super::turn::CHECKPOINT_VOICE_QUIET));
 }
+
+#[tokio::test]
+async fn twenty_milliseconds_of_pcm_flushes_without_waiting_for_a_third_frame() {
+    let mut media = CandidateMedia::new();
+    let mut sink = RecordingSink::default();
+    pump_audio(&mut media, &mut sink, Some(frame_of(160)))
+        .await
+        .unwrap();
+    assert!(sink.sent.is_empty());
+    pump_audio(&mut media, &mut sink, Some(frame_of(160)))
+        .await
+        .unwrap();
+    assert_eq!(sink.sent.len(), 1);
+    assert_eq!(sink.sent[0].len(), 640);
+    assert!(media.audio_bytes.is_empty());
+}
+
+#[tokio::test]
+async fn latency_marker_follows_only_the_first_complete_frame() {
+    let (mut output, mut frames) = test_output_audio();
+    output.latency_marker = Some((serde_json::json!({"turn": 42}), Instant::now()));
+    assert!(
+        !output
+            .capture(&[0; 2], "audio/pcm;rate=24000")
+            .await
+            .unwrap()
+    );
+    assert!(output.latency_marker.is_some());
+    assert!(
+        output
+            .capture(&[0; 958], "audio/pcm;rate=24000")
+            .await
+            .unwrap()
+    );
+    let first = frames.try_recv().unwrap();
+    assert_eq!(first.latency_marker.unwrap().0["turn"], 42);
+    assert!(frames.try_recv().unwrap().latency_marker.is_none());
+    assert!(frames.try_recv().is_err());
+    output.latency_marker = Some((serde_json::json!({"turn": 43}), Instant::now()));
+    output.interrupt();
+    assert!(output.latency_marker.is_none());
+}
+
+#[test]
+fn a_partial_first_audio_frame_has_a_cancellation_record() {
+    let (mut output, _frames) = test_output_audio();
+    output.latency_marker = Some((
+        serde_json::json!({"turn": 42, "elapsed_ms": 100, "observed_ms": 200}),
+        Instant::now(),
+    ));
+    let record = output.cancel_latency_marker().unwrap();
+    assert_eq!(record["turn"], 42);
+    assert_eq!(record["stage"], "native_audio_cancelled");
+    assert_eq!(record["captured"], false);
+    assert!(output.latency_marker.is_none());
+    assert!(output.cancel_latency_marker().is_none());
+}
+
+#[test]
+fn a_failed_first_frame_enqueue_is_not_misreported_as_native_capture() {
+    let now = Instant::now();
+    let record = enqueue_failure_record(
+        (
+            serde_json::json!({"turn": 8, "elapsed_ms": 500, "observed_ms": 900}),
+            now,
+        ),
+        now + Duration::from_millis(10),
+    );
+    assert_eq!(record["turn"], 8);
+    assert_eq!(record["stage"], "audio_enqueue_failed");
+    assert_eq!(record["captured"], false);
+    assert_eq!(record["enqueued"], false);
+    assert_eq!(record["native_capture_ms"], 0);
+    assert_eq!(record["server_total_ms"], 510);
+}
+
+/// The queue depth logged with a reply's first audio is the frames the worker
+/// has not taken yet, which is what says whether playout is backed up.
+#[tokio::test]
+async fn queued_frames_counts_the_frames_the_worker_has_not_taken() {
+    let (mut output, mut frames) = test_output_audio();
+    assert_eq!(output.queued_frames(), 0);
+    assert!(
+        output
+            .capture(&[0; 240 * 2 * 3], "audio/pcm;rate=24000")
+            .await
+            .unwrap()
+    );
+    assert_eq!(output.queued_frames(), 3);
+    frames.try_recv().unwrap();
+    assert_eq!(output.queued_frames(), 2);
+}

@@ -93,6 +93,7 @@ use crate::runtime::{AGENT_NAME, RuntimeBootstrap, agent_identity};
 use crate::token::{LivekitTokenInput, livekit_token};
 
 mod board;
+mod latency;
 mod media;
 mod report;
 mod rooms;
@@ -469,6 +470,7 @@ fn runtime_activity(config: &AgentConfig, started_at: Instant, session_id: u64) 
         .with_reply_timeout(Duration::from_secs(u64::from(
             config.gemini_reply_timeout_s,
         )))
+        .with_first_output_deadline(Duration::from_secs(u64::from(config.gemini_first_output_s)))
 }
 
 /// Opens a session that remembers nothing, retrying while the budget allows.
@@ -811,7 +813,7 @@ async fn replace_gemini_session(
         interview.boot.room_name
     );
     close_turns(room, context).await?;
-    set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING).await?;
+    set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING);
     publish_interviewer_state(room, &interviewer_state(false)).await?;
     let spoke = if let Some(handoff) = speech_handoff {
         if resumed {
@@ -1015,7 +1017,7 @@ async fn brief_replacement(
             // before answering it still owes what the briefing asked about, and
             // naming the briefing there would nest it, transcript and all,
             // inside the next one.
-            activity.mark_prompted(Instant::now(), owed_prompt, false);
+            activity.mark_recovery_prompted(Instant::now(), owed_prompt);
             state.recovery_reply_pending = true;
             true
         }
@@ -1528,7 +1530,7 @@ async fn open_session<'a>(
 ) -> Result<Option<OpenSession<'a>>, Box<dyn std::error::Error + Send + Sync>> {
     let agent_identity = agent_identity(room_name);
     let (room, mut events) = join_room(config, room_name, &agent_identity, now_seconds).await?;
-    let mut agent_state = String::new();
+    let mut agent_state = session::AgentState::default();
     session::publish_opening_attributes(&room, &mut agent_state, config.gemini_silence_ms).await?;
 
     // The candidate's metadata picks the problem, so nothing else can start
@@ -1558,10 +1560,14 @@ async fn open_session<'a>(
     // dependency is on room state, not on data.
     let setup_began = Instant::now();
     let mut restarts = 0;
+    let mut room_ready = Duration::ZERO;
+    let mut gemini_ready = Duration::ZERO;
     let (output_audio, mut gemini) = tokio::try_join!(
         async {
             isolate_local_agent(config, room_name, &agent_identity, now_seconds).await?;
-            publish_output_audio(&room, GEMINI_OUTPUT_AUDIO_SAMPLE_RATE).await
+            let published = publish_output_audio(&room, GEMINI_OUTPUT_AUDIO_SAMPLE_RATE).await;
+            room_ready = setup_began.elapsed();
+            published
         },
         async {
             let interview = InterviewContext {
@@ -1573,16 +1579,23 @@ async fn open_session<'a>(
                 events: &events,
                 slot: None,
             };
-            crate::gemini::first_open_within(
+            let opened = crate::gemini::first_open_within(
                 crate::gemini::FIRST_OPEN_LIMIT,
                 open_cold_session(interview, &mut restarts, None),
             )
-            .await
+            .await;
+            gemini_ready = setup_began.elapsed();
+            opened
         },
     )?;
+
+    // Which branch held the greeting back: an earlier Gemini connect can only
+    // help when Gemini is the later of the two.
     eprintln!(
-        "timing: room and Gemini session ready {:.2}s after the candidate joined",
-        setup_began.elapsed().as_secs_f64()
+        "timing: room and Gemini session ready {:.2}s after the candidate joined (room {:.2}s, gemini {:.2}s)",
+        setup_began.elapsed().as_secs_f64(),
+        room_ready.as_secs_f64(),
+        gemini_ready.as_secs_f64()
     );
 
     // The candidate's clock, not a third one. The browser starts counting when
@@ -1598,6 +1611,12 @@ async fn open_session<'a>(
         activity: runtime_activity(config, started_at, session_id),
         turns: SpeakerTurns::default(),
     };
+    turn.activity.latency.bind(
+        &room.name(),
+        session_id,
+        turn.activity.live_socket,
+        config.gemini_silence_ms,
+    );
     turn.state
         .evidence_ledger
         .record_model_input(ModelInputKind::LiveSetup, &boot.instructions);
@@ -1822,9 +1841,13 @@ async fn on_watch_tick(
     ) == ReplyWatch::Recover
     {
         loops.deferred_restart.cancel();
+        let waited = context
+            .activity
+            .expired_reply_wait(tick_at, context.output_audio.is_playing())
+            .unwrap_or(context.activity.reply_timeout);
         eprintln!(
             "Gemini reply timed out after {}s; reconnecting at={} room={}",
-            context.activity.reply_timeout.as_secs(),
+            waited.as_secs(),
             log_clock(context.state),
             interview.boot.room_name
         );
@@ -1854,7 +1877,7 @@ async fn on_watch_tick(
     // publishes `speaking`, a completed or cut turn, a replacement and a pause
     // publish `listening`, and so does the candidate speaking again.
     if reply == (ReplyWatch::Owed { shown: true }) {
-        set_agent_state(room, context.agent_state, AGENT_STATE_THINKING).await?;
+        set_agent_state(room, context.agent_state, AGENT_STATE_THINKING);
     }
 
     // Not `?`, for the reason the nudge below gives. A ping that times out has
@@ -2098,6 +2121,7 @@ fn note_candidate_audio_frame(
     let voiced = !state.paused && frame.is_some_and(media::frame_has_voice);
     if voiced && !state.floor_held() {
         activity.turn_timing.note_voice(now);
+        activity.latency.voice(now);
     }
     if voiced
         && (state.context_compression.is_some()
@@ -2154,9 +2178,10 @@ fn update_pause_activity(
             .filter(|_| activity.owes_prompt());
         hold_owed_reply(state, owed_prompt);
     }
-    activity.discarding_output = pause_leaves_output_in_flight(activity, now);
-    activity.stale_turn_pending = activity.generating && !activity.discarding_output;
+    activity.discarding_output |= pause_leaves_output_in_flight(activity, now);
+    activity.stale_turn_pending |= activity.generating && !activity.discarding_output;
     cut_off_turn(activity, output_audio);
+    activity.latency.close(latency::Boundary::Paused, now);
 }
 
 /// The event a resume owes a reply for, read before the resume prompt is
@@ -2482,7 +2507,7 @@ async fn on_playout_settled(
         return Ok(ControlFlow::Continue(()));
     }
     context.activity.mark_listening();
-    set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING).await?;
+    set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING);
     if spend_deferred_restart(room, context, loops, interview, "playout")
         .await?
         .is_break()
@@ -2700,9 +2725,9 @@ pub(crate) async fn run_room_with_slot(
                 frame = next_audio_frame(&mut media.audio), if media.audio.is_some() => {
                     // The fastest writer in the loop, and so the one that
                     // reaches a closed socket first: a flush leaves every
-                    // hundred milliseconds of speech. Dropping the frame costs
-                    // a tenth of a second of audio the resumed session did not
-                    // need; propagating cost the interview.
+                    // twenty milliseconds of speech. Dropping the frame costs a
+                    // frame of audio the resumed session did not need;
+                    // propagating cost the interview.
                     let ended = frame.is_none();
 
                     // Read by checkpoints and the idle timers before the first
@@ -3216,6 +3241,7 @@ async fn begin_button_hold(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     activity.clear_candidate_voice_activity();
     activity.ignore_input_before_hold(at, grace);
+    activity.latency.close(latency::Boundary::Held, at);
     flush_audio(gemini, candidate_audio).await?;
     gemini.end_audio_turn().await
 }
@@ -3267,9 +3293,9 @@ async fn settle_hold(
                 "Gemini audio stream end failed ({error}); waiting for the close to be reported"
             );
         }
-        if context.activity.floor != Floor::Listening {
-            session::cut_off_for_hold(context.activity, context.output_audio);
-
+        let had_floor = context.activity.floor != Floor::Listening;
+        session::cut_off_for_hold(context.activity, context.output_audio);
+        if had_floor {
             // Owed until a prompt that carries it is sent: the note below can
             // fail to send, and a resumed socket keeps the partial reply.
             context.state.thinking_unheard_reply = true;
@@ -3289,17 +3315,24 @@ async fn settle_hold(
             }
         }
     }
+    if result.thinking_changed == Some(false) {
+        context.activity.resume_reply_wait(at);
+    }
     let release = result.thinking_changed == Some(false) && reply.is_some();
     if !(result.yield_turn || release) {
         return effects;
     }
     context.activity.clear_candidate_voice_activity();
+    if result.yield_turn {
+        context.activity.latency.yielded(at);
+    }
     let finalize_prompt = reply.clone();
     let finalize = async {
         flush_audio(context.gemini, &mut context.media.audio_bytes).await?;
         if context.turns_candidate_open()
             && let Some(prompt) = reply.as_deref()
         {
+            context.activity.latency.recovery_prompt(at);
             send_model_context(
                 context.gemini,
                 context.state,
@@ -3324,7 +3357,7 @@ async fn settle_hold(
         );
         context
             .activity
-            .mark_prompted(Instant::now(), finalize_prompt.as_deref(), false);
+            .mark_recovery_prompted(at, finalize_prompt.as_deref());
         effects.abandoned = true;
     }
     effects
@@ -3493,7 +3526,7 @@ async fn apply_data_packet(
     let effects = settle_hold(context, &result, &mut reply, packet_at, grace).await;
     if effects.cut_off {
         close_turns(room, context).await?;
-        set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING).await?;
+        set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING);
     }
 
     // The reply is already marked owed. Everything else the packet changed
@@ -3544,7 +3577,7 @@ async fn apply_data_packet(
                 &mut std::io::stderr().lock(),
             );
             close_turns(room, context).await?;
-            set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING).await?;
+            set_agent_state(room, context.agent_state, AGENT_STATE_LISTENING);
         }
     }
     if let Some(status) = result.round_changed {

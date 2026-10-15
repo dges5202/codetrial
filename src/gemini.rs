@@ -128,7 +128,8 @@ const GEMINI_EVENT_QUEUE: usize = 256;
 pub struct GeminiLiveSession {
     writer: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
     reader: JoinHandle<()>,
-    events: Receiver<GeminiEvent>,
+    events: Receiver<(std::time::Instant, GeminiEvent)>,
+    event_received_at: Option<std::time::Instant>,
     /// When this socket was opened, which is how the caller tells Gemini's
     /// ordinary connection cap from an endpoint that will not stay up. It lives
     /// here rather than in the loop that reconnects because it is a fact about
@@ -267,7 +268,13 @@ impl GeminiLiveSession {
     }
 
     pub async fn next_event(&mut self) -> Option<GeminiEvent> {
-        self.events.recv().await
+        let (received_at, event) = self.events.recv().await?;
+        self.event_received_at = Some(received_at);
+        Some(event)
+    }
+
+    pub(crate) fn event_received_at(&self) -> Option<std::time::Instant> {
+        self.event_received_at
     }
 
     /// How long this socket has been up.
@@ -1662,6 +1669,10 @@ async fn open_live_session_redacted_at(
             let Some(text) = websocket_message_text(message) else {
                 continue;
             };
+
+            // Before parsing, which decodes audio: the queue time a reply
+            // reports then includes this side's work, not just the channel.
+            let received_at = std::time::Instant::now();
             if let Some(error) = server_api_failure(&text)
                 && error.credential.is_some()
             {
@@ -1694,13 +1705,14 @@ async fn open_live_session_redacted_at(
             for event in message.events {
                 // Bounded on purpose: a stalled main loop must slow the socket
                 // down, not let inbound audio pile up without a ceiling.
-                if sender.send(event).await.is_err() {
+                if sender.send((received_at, event)).await.is_err() {
                     return;
                 }
             }
         }
     });
     Ok(GeminiLiveSession {
+        event_received_at: None,
         writer,
         reader,
         events,
@@ -2085,6 +2097,17 @@ fn live_setup_message(boot: &RuntimeBootstrap<'_>, resume: Option<&str>) -> Valu
             .as_object_mut()
             .expect("generation config is an object")
             .remove("thinkingConfig");
+
+        // 3.8 runs a declaration without `behavior` asynchronously, so the
+        // model would speak before a read, a hint or a recorded step it depends
+        // on had answered. Every tool here is written for the blocking turn 3.1
+        // always gives.
+        for declaration in setup["setup"]["tools"][0]["functionDeclarations"]
+            .as_array_mut()
+            .expect("tool declarations are a list")
+        {
+            declaration["behavior"] = json!("BLOCKING");
+        }
     }
 
     // Every frame stays in the context and is billed again on every later turn,
