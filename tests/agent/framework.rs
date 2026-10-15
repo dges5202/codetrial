@@ -4019,6 +4019,37 @@ fn the_phase_judge_records_star_only_from_inside_the_round() {
     assert!(state.star_declined);
 }
 
+/// The round can open at the interviewer turn in flight when its packet
+/// arrives, once that turn is seen to change, so an answer after it that the
+/// coding round's judgments already read is judged again for STAR rather than
+/// left unjudged.
+#[test]
+fn opening_the_round_has_the_judge_read_it_from_the_question() {
+    let mut state = with_written_code(RuntimeState::default());
+    past_the_coding_gate(&mut state);
+    state.transcript.extend([
+        "Interviewer: Tell me about a hard bug".into(),
+        "Candidate: I traced an outage to a cache entry that never expired.".into(),
+    ]);
+    take_phase_judge_window(&mut state, get_problem(Some("insert-interval")));
+    assert!(!phase_judge_due(&state));
+    apply_data_event(
+        &mut state,
+        TOPIC_CONTROL,
+        &json!({"type": "round_transition", "round": "behavioral"}),
+        99.0,
+    );
+    assert!(state.behavioral_round_started);
+    assert!(phase_judge_due(&state));
+    let question = state.transcript.len() - 2;
+    state.transcript[question] = "Interviewer: Tell me about a hard bug you fixed.".into();
+    let window = take_phase_judge_window(&mut state, get_problem(Some("insert-interval")));
+    assert!(
+        window.contains("cache entry that never expired"),
+        "{window}"
+    );
+}
+
 /// Test is the run's evidence, so the judge is asked for it only while nothing
 /// can run the code; a hand trace is then the only testing, and without the
 /// evidence tool the judge is the only one who can record it.

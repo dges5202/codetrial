@@ -819,6 +819,16 @@ fn control_round_transition(
         state.behavioral_round_prior_turn =
             super::last_speaker_line(&state.transcript, INTERVIEWER_SPEAKER)
                 .map(|(index, line)| (index, line.clone()));
+
+        // The round can open at the interviewer turn in flight at this packet,
+        // once that turn is seen to change, so the judge counts everything from
+        // it as unread: an answer the coding round's judgments read is judged
+        // again for STAR when it turns out to be inside the round.
+        state.judged_transcript_lines = state
+            .behavioral_round_prior_turn
+            .as_ref()
+            .map_or(state.transcript.len(), |(index, _)| *index);
+        state.judged_last_turn.clear();
         state
             .evidence_ledger
             .record_lifecycle(receipt_timestamp_ms, LifecycleTransition::BehavioralStarted);

@@ -1339,9 +1339,7 @@ async fn settle_phase_judge(context: &mut GeminiEventContext<'_>, interview: Int
     }
     if crate::agent::phase_judge_due(context.state)
         && Instant::now() < deadline
-        && context
-            .activity
-            .reserve_phase_judge(context.state, Instant::now())
+        && context.activity.reserve_phase_judge(Instant::now())
     {
         let judgment = spawn_phase_judge(context.state, interview);
         await_phase_judgment(context, interview, judgment, deadline).await;
@@ -1922,7 +1920,7 @@ async fn on_watch_tick(
     if context
         .activity
         .held_transition_needs_judgment(context.state, tick_at)
-        && context.activity.reserve_phase_judge(context.state, tick_at)
+        && context.activity.reserve_phase_judge(tick_at)
     {
         let judgment = spawn_phase_judge(context.state, interview);
         context.activity.phase_judge.start(judgment);
@@ -3447,10 +3445,7 @@ async fn handle_data_packet(
     }
     let judge_running = context.activity.phase_judge.is_running();
     if defers_round_transition(context.state, judge_running, topic, payload)
-        && (judge_running
-            || context
-                .activity
-                .reserve_phase_judge(context.state, Instant::now()))
+        && (judge_running || context.activity.reserve_phase_judge(Instant::now()))
     {
         if !judge_running {
             let judgment = spawn_phase_judge(context.state, interview);

@@ -45,10 +45,12 @@ pub(super) const PHASE_JUDGE_COOLDOWN: Duration = Duration::from_secs(6);
 /// A ceiling for a session whose open steps never close, as when the candidate
 /// never restates the problem: past it the interviewer's own calls remain.
 pub(super) const MAX_PHASE_JUDGES: usize = 48;
-/// How much of that ceiling the coding round leaves for a behavioral round
-/// still to come, whose STAR steps only the judge records once the evidence
-/// tool is gone: a coding round whose steps never closed would otherwise
-/// spend all of it first.
+/// How much of that ceiling the coding round's routine judgments leave for a
+/// behavioral round still to come, whose STAR steps only the judge records
+/// once the evidence tool is gone: a coding round whose steps never closed
+/// would otherwise spend all of it first. The judgments the end and a round
+/// transition ask for may use it, since after either none of it is needed
+/// for the coding round's sake.
 pub(super) const BEHAVIORAL_PHASE_JUDGES: usize = 8;
 /// Between two judgments asked for by the editor alone, and how many of the
 /// ceiling they may take. Typing pauses every few seconds while Coding is
@@ -1540,7 +1542,9 @@ impl RuntimeActivity {
             .is_none_or(|at| now.saturating_duration_since(at) >= cooldown);
         if !rested
             || (editor_only && self.editor_phase_judges >= MAX_EDITOR_PHASE_JUDGES)
-            || !self.reserve_phase_judge(state, now)
+            || (reserves_for_behavioral(state)
+                && self.phase_judges >= MAX_PHASE_JUDGES - BEHAVIORAL_PHASE_JUDGES)
+            || !self.reserve_phase_judge(now)
         {
             return false;
         }
@@ -1552,16 +1556,8 @@ impl RuntimeActivity {
 
     /// Shares the call ceiling with judgments requested by a transition or
     /// the end, which may skip the idle wait but still spend the same budget.
-    pub(super) fn reserve_phase_judge(&mut self, state: &RuntimeState, now: Instant) -> bool {
-        let reserved = state.interview_loop == crate::agent::InterviewLoop::CodingBehavioral
-            && !state.behavioral_round_started
-            && !state.round_transition_seen;
-        let ceiling = if reserved {
-            MAX_PHASE_JUDGES - BEHAVIORAL_PHASE_JUDGES
-        } else {
-            MAX_PHASE_JUDGES
-        };
-        if self.phase_judges >= ceiling {
+    pub(super) fn reserve_phase_judge(&mut self, now: Instant) -> bool {
+        if self.phase_judges >= MAX_PHASE_JUDGES {
             return false;
         }
         self.last_phase_judge = Some(now);
@@ -1991,6 +1987,14 @@ pub(super) const INTERVIEWER_UNAVAILABLE: &str = "interviewer_unavailable";
 /// No goodbye for a candidate who left, and none from an interviewer that
 /// stopped answering: asking it for one would only spend `WRAP_UP_WAIT` in
 /// silence before the report the candidate is waiting for.
+/// Whether a behavioral round may still open, which the coding round's routine
+/// judgments leave `BEHAVIORAL_PHASE_JUDGES` for.
+fn reserves_for_behavioral(state: &RuntimeState) -> bool {
+    state.interview_loop == crate::agent::InterviewLoop::CodingBehavioral
+        && !state.behavioral_round_started
+        && !state.round_transition_seen
+}
+
 pub(super) fn should_send_wrap_up(reason: &str) -> bool {
     reason != "candidate_ended" && reason != INTERVIEWER_UNAVAILABLE
 }

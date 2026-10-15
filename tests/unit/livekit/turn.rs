@@ -1527,33 +1527,38 @@ fn the_phase_judge_follows_a_candidate_turn_within_seconds() {
         !activity.claim_phase_judge(&spoke(), idle + PHASE_JUDGE_COOLDOWN * 4),
         "past the ceiling the interviewer's own calls remain"
     );
-    let opened = RuntimeState {
-        behavioral_round_started: true,
-        ..spoke()
-    };
-    assert!(!activity.reserve_phase_judge(&opened, idle));
+    assert!(!activity.reserve_phase_judge(idle));
     activity.phase_judges = MAX_PHASE_JUDGES - 1;
-    assert!(activity.reserve_phase_judge(&opened, idle));
+    assert!(activity.reserve_phase_judge(idle));
     assert_eq!(activity.phase_judges, MAX_PHASE_JUDGES);
     assert_eq!(activity.last_phase_judge, Some(idle));
-    assert!(!activity.reserve_phase_judge(&opened, idle + PHASE_JUDGE_COOLDOWN));
+    assert!(!activity.reserve_phase_judge(idle + PHASE_JUDGE_COOLDOWN));
 }
 
-/// Without the evidence tool only the judge records STAR, so a coding round
-/// whose steps never closed must not spend the calls a behavioral round still
-/// to come needs. Nothing is held back once that round has opened, been
-/// refused, or was never planned.
+/// Without the evidence tool only the judge records STAR, so the coding
+/// round's routine judgments must not spend the calls a behavioral round still
+/// to come needs. The end and a round transition may: after either nothing is
+/// left to keep them for. Nothing is held back once that round has opened,
+/// been refused, or was never planned.
 #[test]
 fn the_coding_round_leaves_judgments_for_the_behavioral_round() {
-    let now = Instant::now();
-    let coding = RuntimeState::default();
+    let start = Instant::now();
+    let spoke = |state: RuntimeState| RuntimeState {
+        transcript: vec!["Candidate: so I merge the overlapping intervals".to_string()],
+        ..state
+    };
+    let coding = spoke(RuntimeState::default());
     assert_eq!(coding.interview_loop, InterviewLoop::CodingBehavioral);
-    let mut activity = RuntimeActivity::new(now);
-    activity.phase_judges = MAX_PHASE_JUDGES - BEHAVIORAL_PHASE_JUDGES - 1;
-    assert!(activity.reserve_phase_judge(&coding, now));
+    let at = start + PHASE_JUDGE_IDLE;
+    let mut activity = RuntimeActivity::new(start);
+    activity.phase_judges = MAX_PHASE_JUDGES - BEHAVIORAL_PHASE_JUDGES;
     assert!(
-        !activity.reserve_phase_judge(&coding, now),
+        !activity.claim_phase_judge(&coding, at),
         "the rest is the behavioral round's"
+    );
+    assert!(
+        activity.reserve_phase_judge(at),
+        "the end or a transition may use it"
     );
     for state in [
         RuntimeState {
@@ -1570,10 +1575,9 @@ fn the_coding_round_leaves_judgments_for_the_behavioral_round() {
             ..RuntimeState::default()
         },
     ] {
+        let mut activity = RuntimeActivity::new(start);
         activity.phase_judges = MAX_PHASE_JUDGES - BEHAVIORAL_PHASE_JUDGES;
-        assert!(activity.reserve_phase_judge(&state, now));
-        activity.phase_judges = MAX_PHASE_JUDGES;
-        assert!(!activity.reserve_phase_judge(&state, now));
+        assert!(activity.claim_phase_judge(&spoke(state), at));
     }
 }
 
