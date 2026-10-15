@@ -2,6 +2,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 import unittest
 
@@ -283,6 +284,25 @@ class AggregateTests(unittest.TestCase):
         # The stall is still the worst reply, so it stays findable.
         self.assertEqual(MODULE.turn_id(report["worst"][0]), "r/s1/t3")
 
+    def test_tool_share_counts_tool_replies_per_origin(self):
+        report = MODULE.analyze(
+            [
+                captured(turn=1),
+                captured(turn=2, tool_batches=1, server_total_ms=4_730),
+                captured(turn=3, origin="prompt", server_total_ms=800),
+                # A stall is a rate, so it stays out of the share too.
+                captured(turn=4, tool_batches=1, server_total_ms=12_000),
+            ]
+        )
+        self.assertEqual(
+            report["tool_share"],
+            {
+                "last_voiced_pcm": {"tool": 1, "of": 2},
+                "prompt": {"tool": 0, "of": 1},
+            },
+        )
+        self.assertIn("tool_share_last_voiced_pcm=1/2", MODULE.summary_lines(report))
+
     def test_unmeasured_replies_are_split_by_tool_round(self):
         report = MODULE.analyze(
             [
@@ -515,6 +535,35 @@ class CliTests(unittest.TestCase):
         self.assertEqual(run("--summary", stdin=stdin).returncode, 0)
         self.assertEqual(run("--summary", "--strict", stdin=stdin).returncode, 1)
 
+    def test_a_comparison_reads_the_earlier_log_from_a_file(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            before = Path(scratch) / "before.log"
+            before.write_text(
+                "\n".join(
+                    captured(turn=turn, tool_batches=1, server_total_ms=4_000)
+                    for turn in (1, 2)
+                )
+                + "\n"
+            )
+            after = "\n".join(
+                [
+                    captured(turn=1, tool_batches=1, server_total_ms=4_000),
+                    captured(turn=2, server_total_ms=3_200),
+                ]
+            )
+            text = run("--compare", str(before), stdin=after + "\n")
+            self.assertEqual(text.returncode, 0, text.stderr)
+            self.assertIn("tool round first in 2/2 -> 1/2", text.stdout)
+            self.assertIn("mix -400.0, speed +0.0", text.stdout)
+            self.assertIn("stalls 0/2 -> 0/2", text.stdout)
+            report = json.loads(
+                run("--compare", str(before), "--json", stdin=after + "\n").stdout
+            )
+            self.assertEqual(
+                report["origins"]["last_voiced_pcm"]["mean_ms"],
+                {"before": 1_000.0, "after": 600.0},
+            )
+
     def test_text_and_json_reports(self):
         text = run(stdin=captured() + "\n")
         self.assertEqual(text.returncode, 0, text.stderr)
@@ -522,6 +571,70 @@ class CliTests(unittest.TestCase):
         self.assertIn("verdict=HEALTHY", text.stdout)
         report = json.loads(run("--json", stdin=captured() + "\n").stdout)
         self.assertEqual(sum(report["turns"][0]["waterfall_ms"].values()), 3_730)
+
+
+class ComparisonTests(unittest.TestCase):
+    @staticmethod
+    def report(*beyond):
+        """Spoken replies, each (tool round first, ms beyond the window)."""
+        return MODULE.analyze(
+            [
+                captured(
+                    turn=turn,
+                    tool_batches=int(tool),
+                    server_total_ms=3_000 + ms,
+                )
+                for turn, (tool, ms) in enumerate(beyond, 1)
+            ]
+        )
+
+    def test_the_change_in_the_mean_splits_exactly_into_mix_and_speed(self):
+        before = self.report(*[(True, 1_000)] * 4)
+        after = self.report(*[(True, 1_200)] * 2, *[(False, 200)] * 2)
+        entry = MODULE.compare(before, after)["origins"]["last_voiced_pcm"]
+        self.assertEqual(
+            entry["tool_share"],
+            {"before": {"tool": 4, "of": 4}, "after": {"tool": 2, "of": 4}},
+        )
+        self.assertEqual(entry["mean_ms"], {"before": 1_000.0, "after": 700.0})
+        # Half the replies no longer wait on a tool round, which is worth
+        # 450 ms, while the tool replies that remain each got 200 ms slower.
+        self.assertEqual(entry["mix_ms"], -450.0)
+        self.assertEqual(entry["speed_ms"], 150.0)
+        self.assertEqual(
+            entry["mix_ms"] + entry["speed_ms"],
+            entry["mean_ms"]["after"] - entry["mean_ms"]["before"],
+        )
+        self.assertEqual(
+            entry["kinds"]["tool"]["shift"], {"ms": 200, "ci95_ms": [200, 200]}
+        )
+        # A kind one side never saw has no interval to give.
+        self.assertIsNone(entry["kinds"]["no_tool"]["shift"])
+        self.assertEqual(entry["kinds"]["no_tool"]["before"], {"count": 0})
+
+    def test_the_interval_is_seeded_and_spans_the_resampled_shift(self):
+        before = self.report(*[(True, ms) for ms in (800, 900, 1_000, 1_100, 1_200)])
+        after = self.report(*[(True, ms) for ms in (700, 850, 1_000, 1_150, 1_300)])
+        first = MODULE.compare(before, after)
+        self.assertEqual(first, MODULE.compare(before, after))
+        shift = first["origins"]["last_voiced_pcm"]["kinds"]["tool"]["shift"]
+        self.assertEqual(shift["ms"], 0)
+        low, high = shift["ci95_ms"]
+        self.assertLess(low, 0)
+        self.assertGreater(high, 0)
+
+    def test_stalls_are_compared_as_rates(self):
+        before = self.report((True, 1_000), (True, 9_000))
+        after = self.report((True, 1_000), (False, 200))
+        comparison = MODULE.compare(before, after)
+        self.assertEqual(
+            comparison["stalls"],
+            {"before": {"count": 1, "of": 2}, "after": {"count": 0, "of": 2}},
+        )
+        self.assertEqual(
+            comparison["origins"]["last_voiced_pcm"]["tool_share"]["before"],
+            {"tool": 1, "of": 1},
+        )
 
 
 if __name__ == "__main__":

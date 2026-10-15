@@ -142,6 +142,23 @@ fewer than 20 replies is marked `small_n`: its p95 then lies between its two
 largest values. Compare matched yield settings and input recordings; this
 budget comparison cannot substitute for browser-perceived E2E measurement.
 
+## Comparing two runs
+
+`python3 scripts/analyze-latency.py --compare before.log after.log` compares
+two logs kind of reply by kind; several sessions are pooled by concatenating
+their logs. Two runs' overall medians mislead on their own: provider speed
+moves a run's median by a few hundred milliseconds with nothing else changed,
+and a reply preceded by a tool round waits for a second model pass, so a run
+whose replies take fewer tool rounds is faster without any reply getting
+faster. The comparison therefore reports, per origin, the share of replies a
+tool round came first (`tool_share` in the single-log summary), the median of
+each kind with a 95% bootstrap interval for its shift, and the change in the
+mean split exactly into mix, from a different share of tool replies, and
+speed, from each kind getting faster or slower. Stalls are compared as rates.
+The intervals resample replies one by one and so ignore what replies in one
+session share; interleave the two arms' sessions so that provider drift falls
+on both alike.
+
 ## What is not measured
 
 Gemini Live is one combined audio and model pipeline. These records cannot

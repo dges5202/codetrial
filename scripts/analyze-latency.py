@@ -9,6 +9,7 @@ consecutive segments so the dominant one is visible per turn and in aggregate.
 import argparse
 import json
 import math
+import random
 import sys
 from collections import Counter
 
@@ -254,6 +255,17 @@ def reply_kind(row):
     return f"{row['origin']}_{tool_label(row)}"
 
 
+def tool_share(rows):
+    """Per origin, how many replies a tool round came before, of how many."""
+    return {
+        origin: {
+            "tool": sum(bool(r["tool_batches"]) for r in rows if r["origin"] == origin),
+            "of": sum(r["origin"] == origin for r in rows),
+        }
+        for origin in sorted({r["origin"] for r in rows})
+    }
+
+
 def waterfall(first):
     """Consecutive segments from origin to the first native capture."""
     if not first or first.get("stage") != "native_audio_capture":
@@ -405,6 +417,9 @@ def analyze(lines, slow_ms=1500, stall_ms=5000):
     # a rate, and kept out of the distributions, where a few of them would set
     # every mean and tail.
     typical = [r for r in comparable if not r["stalled"]]
+    chosen = {id(r) for r in typical}
+    for row in rows:
+        row["typical"] = id(row) in chosen
 
     # Whether replies slow as the conversation grows: the part of each wait
     # the model is responsible for, against the context it started from.
@@ -482,6 +497,10 @@ def analyze(lines, slow_ms=1500, stall_ms=5000):
                 if r["first_audio"].get("tool_ack_ms") is not None
             ]
         ),
+        # A tool round costs the reply a second model pass, so how many
+        # replies take one moves the typical wait as much as how fast each
+        # kind is.
+        "tool_share": tool_share(typical),
         "beyond_window_by_kind": {
             kind: statistics(
                 [r["beyond_window_ms"] for r in typical if reply_kind(r) == kind]
@@ -528,6 +547,159 @@ def analyze(lines, slow_ms=1500, stall_ms=5000):
         "slow_turns": [turn_id(r) for r in comparable if r["slow"]],
         "worst": sorted(comparable, key=lambda r: -r["beyond_window_ms"])[:5],
     }
+
+
+# Resamples behind each interval. Seeded, so the same logs give the same report.
+BOOTSTRAP_RESAMPLES = 2000
+
+
+def median(values):
+    return percentile(sorted(values), 0.50)
+
+
+def median_shift(before, after, rng):
+    """After's median less before's, with a 95% percentile-bootstrap interval.
+
+    Replies are resampled one by one, which ignores what replies in one session
+    share, so the interval is if anything too narrow.
+    """
+    shifts = sorted(
+        median(rng.choices(after, k=len(after)))
+        - median(rng.choices(before, k=len(before)))
+        for _ in range(BOOTSTRAP_RESAMPLES)
+    )
+    return {
+        "ms": round(median(after) - median(before), 1),
+        "ci95_ms": [percentile(shifts, 0.025), percentile(shifts, 0.975)],
+    }
+
+
+def compare(before, after):
+    """How replies of each origin changed between two reports.
+
+    Two runs' medians alone mislead: provider speed moves a run's median by a
+    few hundred milliseconds, and a run with more tool replies is slower with
+    nothing else changed. So each kind of reply is compared on its own, and the
+    change in the mean is split exactly into mix, the part from a different
+    share of tool replies, and speed, the part from each kind getting faster or
+    slower. A kind one side never saw is priced at the other side's mean, so it
+    counts as mix.
+    """
+    rng = random.Random(0)
+    sides = {
+        name: [r for r in report["turns"] if r["typical"]]
+        for name, report in (("before", before), ("after", after))
+    }
+    origins = sorted({r["origin"] for rows in sides.values() for r in rows})
+    out = {}
+    for origin in origins:
+        kinds = {}
+        mix = speed = 0.0
+        totals = {
+            name: sum(r["origin"] == origin for r in rows)
+            for name, rows in sides.items()
+        }
+        for kind in ("no_tool", "tool"):
+            values = {
+                name: [
+                    r["beyond_window_ms"]
+                    for r in rows
+                    if r["origin"] == origin and tool_label(r) == kind
+                ]
+                for name, rows in sides.items()
+            }
+            if not any(values.values()):
+                continue
+            share = {
+                name: len(values[name]) / totals[name] if totals[name] else 0.0
+                for name in sides
+            }
+            mean = {name: sum(v) / len(v) for name, v in values.items() if v}
+            mean.setdefault("before", mean.get("after"))
+            mean.setdefault("after", mean.get("before"))
+            mix += (
+                (share["after"] - share["before"])
+                * (mean["after"] + mean["before"])
+                / 2
+            )
+            speed += (
+                (share["after"] + share["before"])
+                / 2
+                * (mean["after"] - mean["before"])
+            )
+            kinds[kind] = {
+                "before": statistics(values["before"]),
+                "after": statistics(values["after"]),
+                "shift": median_shift(values["before"], values["after"], rng)
+                if all(len(v) > 1 for v in values.values())
+                else None,
+            }
+        means = {
+            name: [r["beyond_window_ms"] for r in rows if r["origin"] == origin]
+            for name, rows in sides.items()
+        }
+        out[origin] = {
+            "tool_share": {
+                name: tool_share(rows).get(origin, {"tool": 0, "of": 0})
+                for name, rows in sides.items()
+            },
+            "kinds": kinds,
+            "mean_ms": {
+                name: round(sum(v) / len(v), 1) if v else None
+                for name, v in means.items()
+            },
+            "mix_ms": round(mix, 1),
+            "speed_ms": round(speed, 1),
+        }
+    return {
+        "origins": out,
+        "stalls": {"before": before["stalls"], "after": after["stalls"]},
+    }
+
+
+def render_comparison(comparison):
+    lines = [
+        "Time beyond the silence window, after less before. Medians per kind of",
+        "reply, with a 95% bootstrap interval; the mean's change split into mix",
+        "(share of tool replies) and speed (each kind faster or slower).",
+    ]
+    for origin, entry in comparison["origins"].items():
+        share = entry["tool_share"]
+        lines.append(
+            f"\n{origin}: tool round first in "
+            + " -> ".join(
+                f"{share[side]['tool']}/{share[side]['of']}"
+                for side in ("before", "after")
+            )
+        )
+        for kind, stats in entry["kinds"].items():
+            cells = [
+                f"n{stats[side]['count']} p50={stats[side]['p50_ms']}"
+                if stats[side]["count"]
+                else "none"
+                for side in ("before", "after")
+            ]
+            line = f"  {kind:<8} {cells[0]} -> {cells[1]}"
+            if stats["shift"]:
+                low, high = stats["shift"]["ci95_ms"]
+                line += f"  shift {stats['shift']['ms']:+} [{low:+}, {high:+}]"
+            lines.append(line)
+        mean = entry["mean_ms"]
+        if None not in mean.values():
+            lines.append(
+                f"  mean     {mean['before']} -> {mean['after']} "
+                f"({mean['after'] - mean['before']:+.1f}): "
+                f"mix {entry['mix_ms']:+}, speed {entry['speed_ms']:+}"
+            )
+    stalls = comparison["stalls"]
+    lines.append(
+        "\nstalls "
+        + " -> ".join(
+            f"{stalls[side]['count']}/{stalls[side]['of']}"
+            for side in ("before", "after")
+        )
+    )
+    return "\n".join(lines)
 
 
 def turn_id(row):
@@ -646,6 +818,8 @@ def summary_lines(report):
     ):
         if report[label]["count"]:
             out.append(stat_line(label, report[label]))
+    for origin, share in report["tool_share"].items():
+        out.append(f"tool_share_{origin}={share['tool']}/{share['of']}")
     for kind, stats in report["beyond_window_by_kind"].items():
         out.append(stat_line(f"kind_{kind}", stats))
     for band, stats in report["beyond_window_by_context"].items():
@@ -689,6 +863,11 @@ def main():
         help="count a reply this far beyond the window as a stall, not a slow reply",
     )
     parser.add_argument(
+        "--compare",
+        metavar="BEFORE_LOG",
+        help="compare the log against this earlier one, kind of reply by kind",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="also fail on rejected records or when no input-to-capture reply was measured",
@@ -699,6 +878,18 @@ def main():
             report = analyze(stream, args.slow_ms, args.stall_ms)
     else:
         report = analyze(sys.stdin, args.slow_ms, args.stall_ms)
+    if args.compare:
+        with open(args.compare, encoding="utf-8", errors="replace") as stream:
+            before = analyze(stream, args.slow_ms, args.stall_ms)
+        if not report["turns"] or not before["turns"]:
+            return 1
+        comparison = compare(before, report)
+        print(
+            json.dumps(comparison, indent=2)
+            if args.json
+            else render_comparison(comparison)
+        )
+        return 0
     if args.json:
         print(json.dumps(report, indent=2))
     elif args.summary:
