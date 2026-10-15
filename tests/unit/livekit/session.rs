@@ -4252,3 +4252,43 @@ fn an_interruption_after_output_closes_the_latency_trace() {
     assert_eq!(record["stage"], "interrupted");
     assert_eq!(record["elapsed_ms"], 600);
 }
+
+/// The acknowledgement fits only when nothing else should be heard: not with
+/// the floor held, not before a goodbye, and not over or onto any of a reply.
+#[tokio::test]
+async fn a_tool_acknowledgement_fits_only_with_nothing_else_to_hear() {
+    let start = Instant::now();
+    let call = |name: &str| GeminiFunctionCall {
+        id: "1".to_string(),
+        name: name.to_string(),
+        args: serde_json::json!({}),
+    };
+    let read = [call(TOOL_READ_EDITOR)];
+    let mut state = RuntimeState::default();
+    let (mut output, _frames) = test_output_audio();
+    output.playout_deadline = start;
+    assert!(tool_ack_fits(&state, &output, &read, start));
+
+    state.thinking_hold = ThinkingHold::Held { since: start };
+    assert!(!tool_ack_fits(&state, &output, &read, start), "floor held");
+    state.thinking_hold = ThinkingHold::default();
+    state.paused = true;
+    assert!(!tool_ack_fits(&state, &output, &read, start), "paused");
+    state.paused = false;
+    output.playout_deadline = start + Duration::from_millis(1);
+    assert!(
+        !tool_ack_fits(&state, &output, &read, start),
+        "audio playing"
+    );
+    output.playout_deadline = start;
+    assert!(
+        !tool_ack_fits(
+            &state,
+            &output,
+            &[call(TOOL_READ_EDITOR), call(TOOL_END_INTERVIEW)],
+            start
+        ),
+        "before a goodbye"
+    );
+    assert!(tool_ack_fits(&state, &output, &read, start));
+}

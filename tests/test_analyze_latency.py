@@ -297,6 +297,23 @@ class AggregateTests(unittest.TestCase):
         )
         self.assertEqual(report["unmeasured_by_tool"], {"tool": 1, "no_tool": 1})
 
+    def test_an_acknowledgement_reports_how_much_sooner_something_was_heard(self):
+        report = MODULE.analyze(
+            [
+                captured(
+                    turn=1, tool_batches=1, first_tool_call_ms=3_150, tool_ack_ms=3_160
+                ),
+                captured(turn=2),
+            ]
+        )
+        self.assertEqual(report["tool_ack_lead"]["count"], 1)
+        # To the reply's capture, not its acceptance: queued behind the clip,
+        # the reply is heard only when the clip has played.
+        self.assertEqual(report["tool_ack_lead"]["p50_ms"], 570)
+        self.assertIn(
+            "tool_ack_lead=n1 p50=570 p95=570 small_n", MODULE.summary_lines(report)
+        )
+
     def test_tool_rounds_after_the_first_audio_do_not_make_a_tool_reply(self):
         report = MODULE.analyze(
             [

@@ -67,6 +67,9 @@ pub const DEFAULT_WEB_DIR: &str = "web";
 pub const DEFAULT_WEB_ADDR: &str = "127.0.0.1:3000";
 pub const DEFAULT_COMPILER_EXPLORER_ENABLED: bool = true;
 pub const DEFAULT_GEMINI_CANDIDATE_VIDEO_ENABLED: bool = false;
+/// Off until measured in real interviews: a short spoken acknowledgement
+/// played while a tool round holds the reply back. See `gemini::tool_ack_clip`.
+pub const DEFAULT_GEMINI_TOOL_ACK: bool = false;
 
 /// How many interviews one `codetrial web` process will host agents for at
 /// once. Each is a LiveKit room plus a metered Gemini Live session, so an
@@ -564,6 +567,7 @@ pub struct AgentConfig {
     pub room_prefix: String,
     pub default_duration_min: u32,
     pub gemini_candidate_video_enabled: bool,
+    pub gemini_tool_ack: bool,
     pub max_interim_reviews: usize,
     pub gemini_reply_timeout_s: u32,
     pub gemini_first_output_s: u32,
@@ -781,6 +785,10 @@ pub fn load_from_pairs(
             values
                 .get("CODETRIAL_GEMINI_CANDIDATE_VIDEO_ENABLED")
                 .map(String::as_str),
+        ),
+        gemini_tool_ack: parse_bool(
+            values.get("CODETRIAL_GEMINI_TOOL_ACK").map(String::as_str),
+            DEFAULT_GEMINI_TOOL_ACK,
         ),
         max_interim_reviews: optional_u32(
             &values,

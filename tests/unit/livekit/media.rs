@@ -670,6 +670,51 @@ fn a_failed_first_frame_enqueue_is_not_misreported_as_native_capture() {
     assert_eq!(record["server_total_ms"], 510);
 }
 
+/// Generated speech arrives padded with silence, which in front of a reply is
+/// only delay: the voiced stretch is kept with a little margin either side.
+#[test]
+fn an_acknowledgement_loses_its_padding_but_not_its_edges() {
+    let pcm = |samples: &[i16]| {
+        samples
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect::<Vec<u8>>()
+    };
+    let rate = 1_000; // a 20-sample margin
+    let mut samples = vec![0i16; 100];
+    samples.extend([600, -700, 800]);
+    samples.extend(vec![10i16; 100]);
+    let trimmed = trim_silence(&pcm(&samples), rate);
+    // 20 + 3 + 20 samples, padded to whole 10-sample frames with silence.
+    assert_eq!(trimmed.len(), 50 * 2);
+    assert_eq!(&trimmed[40..46], &pcm(&[600, -700, 800])[..]);
+    assert_eq!(&trimmed[46..86], &pcm(&[10; 20])[..]);
+    assert!(trimmed[86..].iter().all(|byte| *byte == 0));
+    assert!(trim_silence(&pcm(&[0, 5, -5]), rate).is_empty());
+    let mut lone = pcm(&[900]);
+    lone.resize(20, 0);
+    assert_eq!(trim_silence(&pcm(&[900]), rate), lone);
+}
+
+/// Audio queued into idle output is heard alone: not after a frame still
+/// playing, and not onto a chunk or a first-audio marker of a reply that has
+/// not made a frame yet.
+#[tokio::test]
+async fn idle_output_has_nothing_playing_or_waiting_to() {
+    let (mut output, _frames) = test_output_audio();
+    let now = Instant::now();
+    output.playout_deadline = now;
+    assert!(output.idle_at(now));
+    output.playout_deadline = now + Duration::from_millis(1);
+    assert!(!output.idle_at(now));
+    output.playout_deadline = now;
+    output.pending_bytes = vec![0; 2];
+    assert!(!output.idle_at(now));
+    output.pending_bytes.clear();
+    output.latency_marker = Some((serde_json::json!({}), now));
+    assert!(!output.idle_at(now));
+}
+
 /// The queue depth logged with a reply's first audio is the frames the worker
 /// has not taken yet, which is what says whether playout is backed up.
 #[tokio::test]
@@ -685,4 +730,179 @@ async fn queued_frames_counts_the_frames_the_worker_has_not_taken() {
     assert_eq!(output.queued_frames(), 3);
     frames.try_recv().unwrap();
     assert_eq!(output.queued_frames(), 2);
+}
+
+/// The guard ends its task when it goes, so a session that closes or fails to
+/// open leaves no acknowledgement request running behind it.
+#[tokio::test]
+async fn dropping_the_guard_cancels_its_task() {
+    let task = tokio::spawn(std::future::pending::<()>());
+    drop(AbortOnDrop(task.abort_handle()));
+    let ended = tokio::time::timeout(Duration::from_secs(1), task).await;
+    assert!(ended.expect("the task ended").unwrap_err().is_cancelled());
+}
+
+/// The reply's first chunk cuts the acknowledgement: every clip frame is
+/// cancelled, the reply's own frames and marker are not, and playout is no
+/// longer counted behind the clip. A chunk the output refuses cuts nothing.
+#[tokio::test]
+async fn a_reply_cuts_the_acknowledgement_it_would_wait_behind() {
+    let (mut output, mut frames) = test_output_audio();
+    let size = output.sample_rate as usize / 100 * 2;
+    let mime = format!("audio/pcm;rate={}", output.sample_rate);
+    output
+        .capture_tool_ack(&vec![0; size * 3], &mime)
+        .await
+        .unwrap();
+    let clip = output.output_cancellation.clone();
+    assert!(!output.prepare_reply(&[0; 2], "audio/pcm;rate=16000"));
+    assert!(!clip.is_cancelled());
+    assert!(output.prepare_reply(&[2], &mime));
+    assert!(clip.is_cancelled());
+    assert!(!output.is_playing());
+    output.latency_marker = Some((serde_json::json!({"turn": 42}), Instant::now()));
+    assert!(!output.capture(&[2], &mime).await.unwrap());
+    assert!(output.capture(&vec![0; size - 1], &mime).await.unwrap());
+    for _ in 0..3 {
+        let ack = frames.try_recv().unwrap();
+        assert!(ack.output_cancellation.is_cancelled());
+        assert!(ack.latency_marker.is_none());
+    }
+    let reply = frames.try_recv().unwrap();
+    assert!(!reply.output_cancellation.is_cancelled());
+    assert_eq!(reply.samples[0], 2);
+    assert_eq!(reply.latency_marker.unwrap().0["turn"], 42);
+    assert!(frames.try_recv().is_err());
+
+    // Cut once: the next reply chunk leaves the reply's own frames alone.
+    let reply_token = output.output_cancellation.clone();
+    assert!(output.prepare_reply(&[0; 2], &mime));
+    assert!(!reply_token.is_cancelled());
+}
+
+struct PreemptibleOutputSink {
+    events: mpsc::UnboundedSender<&'static str>,
+    cancel_on_capture: Option<CancellationToken>,
+}
+
+impl OutputAudioSink for PreemptibleOutputSink {
+    async fn capture_frame(
+        &self,
+        frame: &AudioFrame<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if frame.data[0] == 1 {
+            self.events.send("ack capture").unwrap();
+            if let Some(token) = &self.cancel_on_capture {
+                token.cancel();
+                return Ok(());
+            }
+            std::future::pending::<()>().await;
+        }
+        self.events.send("reply capture").unwrap();
+        Ok(())
+    }
+
+    fn clear_buffer(&self) {
+        self.events.send("clear").unwrap();
+    }
+}
+
+#[tokio::test]
+async fn reply_does_not_wait_for_queued_or_inflight_ack_capture() {
+    for inflight in [false, true] {
+        let (mut output, frames) = test_output_audio();
+        let samples = output.sample_rate as usize / 100;
+        let mime = format!("audio/pcm;rate={}", output.sample_rate);
+        let ack: Vec<u8> = vec![1_i16; samples * 3]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        output.capture_tool_ack(&ack, &mime).await.unwrap();
+        let (events, mut observed) = mpsc::unbounded_channel();
+        let sink = PreemptibleOutputSink {
+            events,
+            cancel_on_capture: None,
+        };
+        let mut worker = None;
+        let mut waiting = Some((sink, frames));
+        if inflight {
+            let (sink, frames) = waiting.take().unwrap();
+            worker = Some(tokio::spawn(output_audio_worker(
+                sink,
+                output.sample_rate,
+                frames,
+            )));
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), observed.recv())
+                    .await
+                    .expect("the clip reaches the sink")
+                    .unwrap(),
+                "ack capture"
+            );
+        }
+        let reply: Vec<u8> = vec![2_i16; samples]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        assert!(output.prepare_reply(&reply, &mime));
+        output.capture(&reply, &mime).await.unwrap();
+        if let Some((sink, frames)) = waiting {
+            worker = Some(tokio::spawn(output_audio_worker(
+                sink,
+                output.sample_rate,
+                frames,
+            )));
+        }
+        if inflight {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), observed.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "clear"
+            );
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), observed.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            "reply capture"
+        );
+        drop(output);
+        worker.unwrap().await.unwrap();
+        assert!(observed.recv().await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn cancellation_during_successful_capture_clears_before_next_frame() {
+    let token = CancellationToken::new();
+    let (frames, queued) = mpsc::channel(2);
+    for (sample, cancellation) in [(1, token.clone()), (2, CancellationToken::new())] {
+        frames
+            .send(QueuedOutputFrame {
+                latency_marker: None,
+                output_cancellation: cancellation,
+                samples: vec![sample; 240],
+            })
+            .await
+            .unwrap();
+    }
+    drop(frames);
+    let (events, mut observed) = mpsc::unbounded_channel();
+    output_audio_worker(
+        PreemptibleOutputSink {
+            events,
+            cancel_on_capture: Some(token),
+        },
+        24_000,
+        queued,
+    )
+    .await;
+    let mut actual = Vec::new();
+    while let Some(event) = observed.recv().await {
+        actual.push(event);
+    }
+    assert_eq!(actual, ["ack capture", "clear", "reply capture"]);
 }

@@ -1528,6 +1528,25 @@ async fn generate_content_once(
     timeout: Duration,
     what: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let response = post_generate_content(api_key, url, request, timeout, what).await?;
+    gemini_text(&response).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Gemini {what} response had no text"),
+        )
+        .into()
+    })
+}
+
+/// The transport half of `generate_content_once`, for a caller that reads
+/// something other than text out of the answer.
+async fn post_generate_content(
+    api_key: &str,
+    url: &str,
+    request: &Value,
+    timeout: Duration,
+    what: &str,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let started = std::time::Instant::now();
     let response = crate::http_client()
         .post(url)
@@ -1553,13 +1572,7 @@ async fn generate_content_once(
         .map(TokenUsage::from_metadata)
         .unwrap_or_default();
     eprintln!("gemini {what} usage {}", usage.log_fields());
-    gemini_text(&response).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Gemini {what} response had no text"),
-        )
-        .into()
-    })
+    Ok(response)
 }
 
 async fn generate_report_once(
@@ -1748,6 +1761,86 @@ pub(crate) fn gemini_live_websocket_url(api_key: &str) -> String {
 
 fn live_websocket_url_at(endpoint: &str, api_key: &str) -> String {
     format!("{endpoint}?key={}", percent_encode_component(api_key))
+}
+
+/// The model and words of the acknowledgement a tool round may play. Generated
+/// once per interview in the session's own voice and accent, so it sounds like
+/// Jim.
+const TOOL_ACK_TTS_MODEL: &str = "gemini-3.1-flash-tts-preview";
+const TOOL_ACK_WORDS: &str = "Mm, okay.";
+const TOOL_ACK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// What the speech model is asked to say, in the interview's accent when it
+/// has one.
+fn tool_ack_text(accent: Option<&str>) -> String {
+    let accent = accent
+        .map(|accent| format!(", with a natural {accent} accent"))
+        .unwrap_or_default();
+    format!("Say briefly, in a natural, thinking tone{accent}: {TOOL_ACK_WORDS}")
+}
+
+/// A short spoken acknowledgement in `voice`, as 16-bit mono PCM at
+/// `sample_rate`, the output track's own format. One attempt on the report
+/// keys: an interview without it only loses a filler.
+pub(crate) async fn tool_ack_clip(
+    keys: &GeminiKeys,
+    voice: &str,
+    accent: Option<&str>,
+    sample_rate: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let url = gemini_generate_content_url(TOOL_ACK_TTS_MODEL);
+    tool_ack_clip_at(keys, &url, voice, accent, sample_rate).await
+}
+
+async fn tool_ack_clip_at(
+    keys: &GeminiKeys,
+    url: &str,
+    voice: &str,
+    accent: Option<&str>,
+    sample_rate: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let api_key = keys.select_report()?;
+    let request = json!({
+        "contents": [{ "parts": [{ "text": tool_ack_text(accent) }] }],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": { "voiceConfig": { "prebuiltVoiceConfig": { "voiceName": voice } } }
+        }
+    });
+    let response = post_generate_content(
+        &api_key,
+        url,
+        &request,
+        TOOL_ACK_TIMEOUT,
+        "tool acknowledgement",
+    )
+    .await?;
+    tool_ack_pcm(&response, sample_rate)
+}
+
+/// The PCM in a speech response, refusing anything but raw 16-bit samples at
+/// the output track's rate: a container or a codec would play as noise.
+fn tool_ack_pcm(
+    response: &Value,
+    sample_rate: u32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let data = &response["candidates"][0]["content"]["parts"][0]["inlineData"];
+
+    // Media types are case-insensitive, and the speech model answers in lower
+    // case: "audio/l16; rate=24000; channels=1".
+    let mime = data["mimeType"].as_str().unwrap_or_default();
+    let lower = mime.to_ascii_lowercase();
+    let raw = lower.starts_with("audio/l16") || lower.starts_with("audio/pcm");
+    let rate = format!("rate={sample_rate}");
+    if !raw || !lower.split(';').any(|param| param.trim() == rate) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("acknowledgement audio is {mime:?}, not {sample_rate} Hz PCM"),
+        )
+        .into());
+    }
+    let encoded = data["data"].as_str().unwrap_or_default();
+    Ok(STANDARD.decode(encoded)?)
 }
 
 /// No `?key=` here on purpose. A `reqwest` error Displays the URL it was built

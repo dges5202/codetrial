@@ -1549,6 +1549,31 @@ async fn open_session<'a>(
         boot.room_name, boot.problem.id, boot.duration_min
     );
 
+    // Generated beside the setup below and picked up whenever it lands: a tool
+    // round before it is ready simply plays nothing.
+    let tool_ack = Arc::new(std::sync::OnceLock::new());
+    let mut tool_ack_task = None;
+    if config.gemini_tool_ack {
+        let (keys, slot) = (keys.clone(), tool_ack.clone());
+        let (voice, accent) = (boot.voice.to_string(), boot.accent.map(str::to_string));
+        let task = tokio::spawn(async move {
+            match crate::gemini::tool_ack_clip(
+                &keys,
+                &voice,
+                accent.as_deref(),
+                GEMINI_OUTPUT_AUDIO_SAMPLE_RATE,
+            )
+            .await
+            {
+                Ok(pcm) => {
+                    let _ = slot.set(media::trim_silence(&pcm, GEMINI_OUTPUT_AUDIO_SAMPLE_RATE));
+                }
+                Err(error) => eprintln!("tool acknowledgement not generated: {error}"),
+            }
+        });
+        tool_ack_task = Some(media::AbortOnDrop(task.abort_handle()));
+    }
+
     // Only the Gemini session overlaps, and only because it touches nothing in
     // the room. Isolation and publication cannot: isolation exists so that one
     // agent is in the room when the candidate starts subscribing, and running
@@ -1562,7 +1587,7 @@ async fn open_session<'a>(
     let mut restarts = 0;
     let mut room_ready = Duration::ZERO;
     let mut gemini_ready = Duration::ZERO;
-    let (output_audio, mut gemini) = tokio::try_join!(
+    let (mut output_audio, mut gemini) = tokio::try_join!(
         async {
             isolate_local_agent(config, room_name, &agent_identity, now_seconds).await?;
             let published = publish_output_audio(&room, GEMINI_OUTPUT_AUDIO_SAMPLE_RATE).await;
@@ -1588,6 +1613,9 @@ async fn open_session<'a>(
             opened
         },
     )?;
+
+    output_audio.tool_ack = tool_ack;
+    output_audio.tool_ack_task = tool_ack_task;
 
     // Which branch held the greeting back: an earlier Gemini connect can only
     // help when Gemini is the later of the two.

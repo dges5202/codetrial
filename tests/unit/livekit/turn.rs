@@ -2711,6 +2711,44 @@ fn a_queued_required_prompt_supersedes_the_tool_only_followup() {
     assert!(!activity.answered_without_speaking());
 }
 
+/// One acknowledgement per candidate wait, however many tool rounds hold the
+/// reply back, and none without a wait or during a discard.
+#[test]
+fn a_tool_acknowledgement_plays_once_per_wait() {
+    let start = Instant::now();
+    let at = |ms| start + Duration::from_millis(ms);
+    let mut activity = RuntimeActivity::new(start);
+    assert!(!activity.take_tool_ack(at(0)), "nobody is waiting");
+    activity.note_candidate_finished(at(0), false);
+    assert!(activity.take_tool_ack(at(10)));
+    assert!(!activity.take_tool_ack(at(20)), "the same wait");
+
+    // A wait rebased across an interruption is still the same request.
+    activity.awaiting_reply_since = Some(at(3_000));
+    assert!(!activity.take_tool_ack(at(3_010)), "a rebased wait");
+
+    activity.clear_candidate_reply_wait();
+    activity.note_candidate_finished(at(5_000), false);
+    activity.discarding_output = true;
+    assert!(!activity.take_tool_ack(at(5_010)), "a discarded generation");
+    activity.discarding_output = false;
+
+    // Never over the candidate speaking again.
+    activity.note_candidate_voice_activity(true, at(5_020));
+    activity.note_candidate_voice(at(5_030));
+    assert!(
+        !activity.take_tool_ack(at(5_040)),
+        "the candidate is speaking"
+    );
+    activity.note_candidate_voice_activity(false, at(5_050));
+    assert!(activity.take_tool_ack(at(9_000)), "a new wait, once quiet");
+
+    activity.note_candidate_finished(at(9_500), false);
+    activity.clear_candidate_reply_wait();
+    activity.awaiting_reply_since = Some(at(9_600));
+    assert!(!activity.take_tool_ack(at(9_700)), "an answered request");
+}
+
 /// Microphone frames from before the provider's end of speech belong to the
 /// utterance that ended, so they are not the candidate cutting in; only a
 /// voiced frame after that end is.

@@ -57,6 +57,20 @@ barge-in that caused it is the input still waiting for an answer.
 
 ## Waterfall
 
+With `CODETRIAL_GEMINI_TOOL_ACK` set, a tool round that holds back the reply a
+candidate is waiting for, and has heard nothing of, queues a short
+acknowledgement generated once per interview in the session's voice and accent
+(`gemini-3.1-flash-tts-preview`, on the report keys). It plays at most once per
+thing the candidate said, never while they are speaking again, and never
+before a goodbye. It is not the reply: the watchdog and this record still wait
+for the reply's own audio. Its first accepted chunk cancels the remaining clip
+and clears buffered filler before the reply plays. Audio already transmitted
+cannot be recalled. Cancelled queue entries are skipped without capture;
+`output_queue_frames` can include them until the worker drains them. The record
+stamps it as `tool_ack_ms`, and the summary's `tool_ack_lead` is the reply's native
+capture less that stamp: how much sooner the candidate heard something. An
+interview whose clip is not ready yet, or failed to generate, plays nothing.
+
 Offsets share the origin and use the agent's monotonic clock. A milestone seen
 before an origin that later moved is negative, and one never observed is
 `null`. `observed_ms` may be negative when provider receipt precedes the first

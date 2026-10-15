@@ -788,6 +788,23 @@ fn a_long_utterance_keeps_a_bounded_input_history() {
     assert_eq!(record["elapsed_ms"], 500);
 }
 
+/// An acknowledgement is the first sound, not the reply: it is stamped while
+/// the reply is still owed and never after the reply's own audio.
+#[test]
+fn an_acknowledgement_is_stamped_before_the_reply_and_not_after() {
+    let (start, mut trace) = traced();
+    trace.voice(start);
+    trace.voice_end(ms(start, 100));
+    trace.output(ms(start, 150), true);
+    trace.tool_ack(ms(start, 160));
+    trace.tool_ack(ms(start, 300));
+    trace.output(ms(start, 900), false);
+    let record = trace.audio(ms(start, 950)).unwrap();
+    assert_eq!(record["tool_ack_ms"], 160);
+    trace.tool_ack(ms(start, 1_000));
+    assert!(trace.audio(ms(start, 1_100)).is_none());
+}
+
 /// Pruning keeps every voiced frame inside the horizon, the newest one past
 /// it, and every platform prompt, so an event still in flight finds the input
 /// it answers and a prompt is never lost to a long utterance.

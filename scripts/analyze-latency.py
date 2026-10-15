@@ -42,6 +42,7 @@ TIMINGS = (
     "candidate_yield_ms",
     "first_provider_output_ms",
     "first_tool_call_ms",
+    "tool_ack_ms",
     "last_tool_response_ms",
     "tool_handler_ms",
     "provider_event_queue_ms",
@@ -470,6 +471,17 @@ def analyze(lines, slow_ms=1500, stall_ms=5000):
         "beyond_window_with_stalls": statistics(
             [r["beyond_window_ms"] for r in comparable]
         ),
+        # With an acknowledgement played during a tool round, the candidate
+        # hears something before the reply: how much sooner. The clip went out
+        # on an empty queue, so its queueing is its capture; the reply's is its
+        # native capture, which waited behind the clip when the clip was longer.
+        "tool_ack_lead": statistics(
+            [
+                r["server_total_ms"] - r["first_audio"]["tool_ack_ms"]
+                for r in typical
+                if r["first_audio"].get("tool_ack_ms") is not None
+            ]
+        ),
         "beyond_window_by_kind": {
             kind: statistics(
                 [r["beyond_window_ms"] for r in typical if reply_kind(r) == kind]
@@ -630,6 +642,7 @@ def summary_lines(report):
         "beyond_window",
         "beyond_window_with_stalls",
         "transcript_before_end",
+        "tool_ack_lead",
     ):
         if report[label]["count"]:
             out.append(stat_line(label, report[label]))

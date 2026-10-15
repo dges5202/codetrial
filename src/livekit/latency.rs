@@ -95,6 +95,8 @@ struct Trace {
     yielded: Option<Instant>,
     first_output: Option<Instant>,
     first_tool_call: Option<Instant>,
+    /// A local acknowledgement queued while a tool round held the reply.
+    tool_ack: Option<Instant>,
     last_tool_response: Option<Instant>,
     tool_batches: u64,
     tool_handler_ms: u64,
@@ -262,6 +264,7 @@ impl ReplyLatency {
             yielded: None,
             first_output: None,
             first_tool_call: None,
+            tool_ack: None,
             last_tool_response: None,
             tool_batches: 0,
             tool_handler_ms: 0,
@@ -627,6 +630,16 @@ impl ReplyLatency {
         }
     }
 
+    /// The candidate hears something before the reply itself: the first
+    /// sound, which the reply's own audio record still measures past.
+    pub(super) fn tool_ack(&mut self, now: Instant) {
+        if let Some(trace) = self.trace.as_mut()
+            && !trace.audio_accepted
+        {
+            trace.tool_ack.get_or_insert(now);
+        }
+    }
+
     /// A batch that failed to send is recorded but does not move the
     /// continuation's start: nothing reached the model for it to resume on.
     pub(super) fn tool_response(&mut self, now: Instant, handler_ms: u64, sent: bool) -> Value {
@@ -736,6 +749,7 @@ impl ReplyLatency {
             "candidate_yield_ms": at(trace.yielded),
             "first_provider_output_ms": at(trace.first_output),
             "first_tool_call_ms": at(trace.first_tool_call),
+            "tool_ack_ms": at(trace.tool_ack),
             "last_tool_response_ms": at(trace.last_tool_response),
             "tool_batches": trace.tool_batches,
             "tool_handler_ms": trace.tool_handler_ms,

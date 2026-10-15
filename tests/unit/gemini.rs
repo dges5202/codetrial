@@ -4565,3 +4565,86 @@ async fn queued_transcripts_keep_the_provider_receipt_time() {
     session.shutdown().await.unwrap();
     server.abort();
 }
+
+/// The acknowledgement is played straight into the output track, so audio at
+/// any other rate is refused rather than played at the wrong speed.
+#[test]
+fn a_tool_acknowledgement_is_taken_only_at_the_output_rate() {
+    let response = |mime: &str| {
+        json!({"candidates": [{"content": {"parts": [{"inlineData": {
+            "mimeType": mime, "data": STANDARD.encode([1u8, 0, 2, 0])
+        }}]}}]})
+    };
+    assert_eq!(
+        tool_ack_pcm(&response("audio/L16;codec=pcm;rate=24000"), 24_000).unwrap(),
+        [1, 0, 2, 0]
+    );
+    assert!(tool_ack_pcm(&response("audio/pcm;rate=24000"), 24_000).is_ok());
+    // What the speech model actually sends: lower case, spaced, with channels.
+    assert!(tool_ack_pcm(&response("audio/l16; rate=24000; channels=1"), 24_000).is_ok());
+    assert!(tool_ack_pcm(&response("audio/L16;codec=pcm;rate=16000"), 24_000).is_err());
+    assert!(tool_ack_pcm(&response("audio/L16;codec=pcm;rate=240000"), 24_000).is_err());
+    assert!(tool_ack_pcm(&response("audio/wav;rate=24000"), 24_000).is_err());
+    assert!(tool_ack_pcm(&json!({}), 24_000).is_err());
+}
+
+/// The acknowledgement is asked for in the interview's accent when it has one,
+/// so it does not sound like another speaker in front of the reply.
+#[test]
+fn a_tool_acknowledgement_is_spoken_in_the_interviews_accent() {
+    assert_eq!(
+        tool_ack_text(None),
+        "Say briefly, in a natural, thinking tone: Mm, okay."
+    );
+    assert_eq!(
+        tool_ack_text(Some("Irish")),
+        "Say briefly, in a natural, thinking tone, with a natural Irish accent: Mm, okay."
+    );
+}
+
+/// The acknowledgement is one speech request in the session's voice, with the
+/// key in a header, and comes back as the decoded samples.
+#[tokio::test]
+async fn a_tool_acknowledgement_is_one_speech_request_in_the_sessions_voice() {
+    let keys = GeminiKeys::single("tool-ack-key");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&requests);
+    let app = axum::Router::new().route(
+        "/",
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let key = headers["x-goog-api-key"].to_str().unwrap().to_string();
+                    seen.lock().unwrap().push((key, body));
+                    axum::Json(
+                        json!({"candidates": [{"content": {"parts": [{"inlineData": {
+                            "mimeType": "audio/L16;codec=pcm;rate=24000",
+                            "data": STANDARD.encode([7u8, 0, 9, 0])
+                        }}]}}]}),
+                    )
+                }
+            },
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let clip = tool_ack_clip_at(&keys, &url, "Charon", None, 24_000)
+        .await
+        .unwrap();
+    server.abort();
+    assert_eq!(clip, [7, 0, 9, 0]);
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    let (key, body) = requests.lock().unwrap()[0].clone();
+    assert_eq!(key, "tool-ack-key");
+    assert_eq!(body["contents"][0]["parts"][0]["text"], tool_ack_text(None));
+    assert_eq!(
+        body["generationConfig"]["responseModalities"],
+        json!(["AUDIO"])
+    );
+    assert_eq!(
+        body["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"],
+        "Charon"
+    );
+}

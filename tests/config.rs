@@ -70,6 +70,27 @@ fn config_bounds_the_reply_timeout() {
 }
 
 #[test]
+fn the_tool_acknowledgement_is_off_unless_asked_for() {
+    let base = [
+        ("LIVEKIT_URL", "wss://example.livekit.cloud"),
+        ("LIVEKIT_API_KEY", "key"),
+        ("LIVEKIT_API_SECRET", "secret"),
+        ("GOOGLE_API_KEY", "google"),
+    ];
+    let ack = |value: Option<&'static str>| {
+        load_from_pairs(
+            base.into_iter()
+                .chain(value.map(|value| ("CODETRIAL_GEMINI_TOOL_ACK", value))),
+        )
+        .expect("config")
+        .gemini_tool_ack
+    };
+    assert!(!ack(None));
+    assert!(ack(Some("1")));
+    assert!(!ack(Some("0")));
+}
+
+#[test]
 fn config_bounds_the_first_output_deadline() {
     let base = [
         ("LIVEKIT_URL", "wss://example.livekit.cloud"),

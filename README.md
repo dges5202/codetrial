@@ -282,6 +282,7 @@ The common ones:
 | `CODETRIAL_MAX_INTERIM_REVIEWS` | `6` | Quiet-pause report-model reviews per interview; `0` disables them and `72` is the maximum |
 | `CODETRIAL_GEMINI_REPLY_TIMEOUT_S` | `45` | Seconds a started interviewer reply may go without further output before the Live socket is replaced (20–120); see [degradation controls](docs/provider-cost-and-degradation.md) |
 | `CODETRIAL_GEMINI_FIRST_OUTPUT_S` | `10` | Seconds an owed reply that nothing has started toward may go with nothing back before the Live socket is replaced (5–120, never above the reply timeout) |
+| `CODETRIAL_GEMINI_TOOL_ACK` | `false` | Experimental: while a tool call holds back a reply the candidate is waiting for, play a short acknowledgement generated once per interview in the interviewer's voice; see [latency observability](docs/latency-observability.md) |
 | `CODETRIAL_GEMINI_CANDIDATE_VIDEO_ENABLED` | `false` | Forward candidate video to Gemini, one low-resolution frame in five seconds; ignored in a whiteboard interview |
 | `CODETRIAL_COMPILER_EXPLORER_ENABLED` | `true` | Enable remote C, C++, and Java runs |
 | `CODETRIAL_MAX_CONCURRENT_INTERVIEWS` | `16` | Interviews one `web` process hosts agents for |

@@ -321,6 +321,12 @@ pub(super) async fn next_video_frame(
 
 pub(super) struct OutputAudio {
     pub(super) latency_marker: Option<(serde_json::Value, Instant)>,
+    /// The acknowledgement a tool round may play, once it has been generated.
+    pub(super) tool_ack: std::sync::Arc<std::sync::OnceLock<Vec<u8>>>,
+    /// The request generating it, cancelled with the session so an interview
+    /// that ends or fails to open first does not pay for a clip nobody hears.
+    pub(super) tool_ack_task: Option<AbortOnDrop>,
+    tool_ack_active: bool,
     pub(super) source: NativeAudioSource,
     pub(super) sample_rate: u32,
     pub(super) pending_bytes: Vec<u8>,
@@ -329,10 +335,44 @@ pub(super) struct OutputAudio {
     pub(super) output_cancellation: CancellationToken,
 }
 
+/// Aborts a spawned task when dropped, so the task lives no longer than its
+/// owner.
+pub(super) struct AbortOnDrop(pub(super) tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub(super) struct QueuedOutputFrame {
     pub(super) latency_marker: Option<(serde_json::Value, Instant)>,
     pub(super) output_cancellation: CancellationToken,
     pub(super) samples: Vec<i16>,
+}
+
+/// Speech generators pad a clip with silence; played in front of a reply, the
+/// padding is only delay. Keeps the voiced stretch of 16-bit mono PCM plus 20
+/// ms either side, or nothing when no sample is voiced, and ends it on a whole
+/// 10 ms frame, padded with silence: a tail shorter than a frame would wait in
+/// `pending_bytes` and be spliced onto the front of the reply.
+pub(super) fn trim_silence(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
+    const VOICED: u16 = 500;
+    let samples = decode_pcm16(pcm);
+    let voiced = |sample: &i16| sample.unsigned_abs() >= VOICED;
+    let (Some(first), Some(last)) = (
+        samples.iter().position(voiced),
+        samples.iter().rposition(voiced),
+    ) else {
+        return Vec::new();
+    };
+    let pad = sample_rate as usize / 50;
+    let start = first.saturating_sub(pad);
+    let end = (last + pad + 1).min(samples.len());
+    let mut clip = pcm[start * 2..end * 2].to_vec();
+    let frame_bytes = sample_rate as usize / 100 * 2;
+    clip.resize(clip.len().next_multiple_of(frame_bytes), 0);
+    clip
 }
 
 impl OutputAudio {
@@ -350,6 +390,9 @@ impl OutputAudio {
             source,
             sample_rate,
             latency_marker: None,
+            tool_ack: Default::default(),
+            tool_ack_task: None,
+            tool_ack_active: false,
             pending_bytes: Vec::new(),
             playout_deadline: Instant::now(),
             frames,
@@ -361,6 +404,7 @@ impl OutputAudio {
         if let Some(record) = self.cancel_latency_marker() {
             super::latency::log(&record);
         }
+        self.tool_ack_active = false;
         self.output_cancellation.cancel();
         self.output_cancellation = CancellationToken::new();
         self.source.clear_buffer();
@@ -386,14 +430,48 @@ impl OutputAudio {
         now < self.playout_deadline
     }
 
+    /// Nothing playing and nothing of a reply waiting to be: no frame still
+    /// ahead of the playout deadline, no chunk too short to make a frame, and
+    /// no first-audio marker waiting for one. Audio queued now would be heard
+    /// alone.
+    pub(super) fn idle_at(&self, now: Instant) -> bool {
+        !self.playing_at(now) && self.pending_bytes.is_empty() && self.latency_marker.is_none()
+    }
+
     /// Whether `capture` would queue anything for this chunk.
     ///
-    /// Split out so the caller can ask before dropping a turn that is still
-    /// playing. Dropping first and then finding the new chunk unusable cuts the
+    /// Split out, through `prepare_reply`, so the caller can ask before
+    /// dropping a turn that is still playing. Dropping first and then finding
+    /// the new chunk unusable cuts the
     /// interviewer off mid-sentence with nothing behind it.
     pub(super) fn accepts(&self, bytes: &[u8], mime_type: &str) -> bool {
         !bytes.is_empty()
             && audio_sample_rate(mime_type, self.sample_rate) == Some(self.sample_rate)
+    }
+
+    /// Whether a reply chunk will be queued, cutting any acknowledgement still
+    /// queued or playing first, before the reply's queue is measured or its
+    /// marker installed: the reply never waits for the filler to finish. The
+    /// filler went out into idle output, so everything the cut cancels is the
+    /// filler's.
+    pub(super) fn prepare_reply(&mut self, bytes: &[u8], mime_type: &str) -> bool {
+        if !self.accepts(bytes, mime_type) {
+            return false;
+        }
+        if self.tool_ack_active {
+            self.interrupt();
+        }
+        true
+    }
+
+    /// Queues the acknowledgement as filler that the reply's first chunk cuts.
+    pub(super) async fn capture_tool_ack(
+        &mut self,
+        bytes: &[u8],
+        mime_type: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        self.tool_ack_active |= self.accepts(bytes, mime_type);
+        self.capture(bytes, mime_type).await
     }
 
     pub(super) async fn capture(
@@ -443,8 +521,32 @@ impl OutputAudio {
     }
 }
 
+/// The native source as the output worker uses it, so a test can stand in a
+/// sink whose capture blocks or completes as cancellation lands.
+trait OutputAudioSink {
+    fn capture_frame(
+        &self,
+        frame: &AudioFrame<'_>,
+    ) -> impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send;
+    fn clear_buffer(&self);
+}
+
+impl OutputAudioSink for NativeAudioSource {
+    async fn capture_frame(
+        &self,
+        frame: &AudioFrame<'_>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        NativeAudioSource::capture_frame(self, frame).await?;
+        Ok(())
+    }
+
+    fn clear_buffer(&self) {
+        NativeAudioSource::clear_buffer(self);
+    }
+}
+
 async fn output_audio_worker(
-    source: NativeAudioSource,
+    source: impl OutputAudioSink,
     sample_rate: u32,
     mut frames: mpsc::Receiver<QueuedOutputFrame>,
 ) {
@@ -468,6 +570,13 @@ async fn output_audio_worker(
             samples_per_channel,
         };
         tokio::select! {
+            biased;
+            _ = &mut cancelled => {
+                if let (Some(marker), Some(dequeued_at)) = (marker, dequeued_at) {
+                    log_first_frame(marker, dequeued_at, None);
+                }
+                source.clear_buffer();
+            }
             result = source.capture_frame(&audio_frame) => {
                 if let (Some(marker), Some(dequeued_at)) = (marker, dequeued_at) {
                     log_first_frame(marker, dequeued_at, Some(result.is_ok()));
@@ -475,12 +584,12 @@ async fn output_audio_worker(
                 if let Err(error) = result {
                     eprintln!("failed to publish output audio frame: {error}");
                 }
-            }
-            _ = &mut cancelled => {
-                if let (Some(marker), Some(dequeued_at)) = (marker, dequeued_at) {
-                    log_first_frame(marker, dequeued_at, None);
+
+                // Capture can enqueue after the producer's clear and complete
+                // as cancellation arrives. Clear before capturing a new token.
+                if frame.output_cancellation.is_cancelled() {
+                    source.clear_buffer();
                 }
-                source.clear_buffer();
             }
         }
     }

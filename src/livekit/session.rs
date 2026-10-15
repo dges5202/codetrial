@@ -995,6 +995,10 @@ async fn on_tool_calls(
     if calls.is_empty() {
         return Ok(());
     }
+    // A filler that fails to queue is not worth the tool round it precedes.
+    if let Err(error) = play_tool_ack(context, &calls).await {
+        eprintln!("tool acknowledgement not played: {error}");
+    }
     let timed = !context.state.floor_held() && !context.activity.discarding_output;
     let reviewed_revision = context.activity.substantive_revision_at_last_review;
     let tool_started = Instant::now();
@@ -1125,6 +1129,52 @@ async fn on_tool_calls(
     }
     flush_framework_progress(room, context.state).await;
     Ok(())
+}
+
+/// A tool round holds back the reply a candidate is waiting for by a model
+/// round trip; when enabled, a short acknowledgement in Jim's voice fills it.
+/// Queued, not counted as the reply: the watchdog and the latency trace still
+/// wait for the reply's own audio. Its first accepted chunk cuts the filler,
+/// so a fast continuation never waits for the clip to finish. What decides
+/// whether to play it is `tool_ack_fits` and `RuntimeActivity::take_tool_ack`.
+async fn play_tool_ack(
+    context: &mut GeminiEventContext<'_>,
+    calls: &[GeminiFunctionCall],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let slot = std::sync::Arc::clone(&context.output_audio.tool_ack);
+    let Some(clip) = slot.get().filter(|clip| !clip.is_empty()) else {
+        return Ok(());
+    };
+    let now = Instant::now();
+    if !tool_ack_fits(context.state, context.output_audio, calls, now)
+        || !context.activity.take_tool_ack(now)
+    {
+        return Ok(());
+    }
+    let mime = format!("audio/pcm;rate={}", context.output_audio.sample_rate);
+    if context.output_audio.capture_tool_ack(clip, &mime).await? {
+        context.activity.latency.tool_ack(now);
+        eprintln!(
+            "timing: tool acknowledgement queued at={}",
+            log_clock(context.state)
+        );
+    }
+    Ok(())
+}
+
+/// Whether the output can take the acknowledgement now: never while the floor
+/// is held (a pause holds it too), never before a goodbye, and only into idle
+/// output, so it neither plays over anything nor has any of the reply spliced
+/// onto it. Whether the candidate is owed one is `take_tool_ack`'s to say.
+pub(super) fn tool_ack_fits(
+    state: &RuntimeState,
+    output_audio: &OutputAudio,
+    calls: &[GeminiFunctionCall],
+    now: Instant,
+) -> bool {
+    !state.floor_held()
+        && output_audio.idle_at(now)
+        && !calls.iter().any(|call| call.name == TOOL_END_INTERVIEW)
 }
 
 /// What the interviewer said, as it is said.
@@ -1292,7 +1342,7 @@ async fn on_generated_audio(
     // Only for a chunk that will actually be queued. Dropping ahead of a chunk
     // `capture` rejects leaves the candidate with a sentence cut in half and no
     // reply behind it.
-    if context.output_audio.accepts(bytes, mime_type) {
+    if context.output_audio.prepare_reply(bytes, mime_type) {
         drop_stale_playout(room, context, interruptible).await?;
         if !context.activity.discarding_output {
             context
